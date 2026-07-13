@@ -6,18 +6,18 @@ Converts either:
   (a) a resampled .mat file (v7.3/HDF5, as produced by fcp-data-muncher), or
   (b) a Level 1 wide-format CSV (a 'Time' column + one column per channel,
       as fcp-data-muncher/MATLAB can export it)
-into a single JSON file matching the schema expected by the FST Lisboa Run
-Catalogue web interface (index.html -> "Add Run" panel). Format is chosen
-automatically from the file extension.
+into a lightweight catalogue entry plus a separate, lazy-loaded telemetry JSON
+file for the FST Lisboa telemetry browser. Format is chosen automatically from
+the file extension.
 
 Usage (.mat input):
-    python3 extract_run.py path/to/run_resampled.mat -o run_export.json \
+    python3 extract_run.py path/to/run_resampled.mat \
         --event "FSPT Testing Day" --session-type "Autocross" --driver "Driver A" \
         --aeropack --springs Medium --arb Stiff --class "Class 1 EV" --origin real \
         --protocol fst.json
 
 Usage (.csv input -- computes Level 2 KPIs directly, no MATLAB needed):
-    python3 extract_run.py path/to/run_level1.csv -o run_export.json \
+    python3 extract_run.py path/to/run_level1.csv \
         --event "FSPT Testing Day" --session-type "Autocross" --driver "Driver A" \
         --protocol fst.json
 
@@ -41,7 +41,8 @@ What it does:
       failure_reason) so the web UI can show exactly why a KPI succeeded or
       failed rather than silently guessing.
     - Buckets each channel into a coarse "component" group for catalogue search
-    - Writes one JSON file: {metadata fields..., channels: [...], kpis: {...}}
+    - Updates catalogue.json and writes telemetry/<run-id>.json. The catalogue
+      contains only searchable metadata; sample arrays are fetched on demand.
 """
 
 import argparse
@@ -122,6 +123,57 @@ def make_kpi(value, unit, status, method="", required_channels=None, failure_rea
         "unit": unit, "status": status, "method": method,
         "required_channels": required_channels, "failure_reason": failure_reason,
     }
+
+
+def json_safe_values(values):
+    """Convert NumPy samples into strict JSON values (NaN/Inf become null)."""
+    values = np.asarray(values, dtype=float)
+    return np.where(np.isfinite(values), values, None).tolist()
+
+
+def downsample_channels(channels, source_rate_hz, target_rate_hz, time_s=None):
+    """Return display telemetry at a bounded uniform rate, preserving sparse signals.
+
+    CAN CSVs commonly contain NaN between actual updates. A fixed stride can
+    repeatedly sample those holes. Instead, every display-time bin takes its
+    last finite reading; if a device did not update during the bin, its last
+    known value is held. Full-rate values are still used for KPI calculation.
+    """
+    if time_s is not None and target_rate_hz > 0:
+        time_s = np.asarray(time_s, dtype=float)
+        duration_s = float(time_s[-1] - time_s[0])
+        output_time = np.arange(0, duration_s + (0.5 / target_rate_hz), 1 / target_rate_hz)
+        sampled = {}
+        for name, values in channels.items():
+            values = np.asarray(values, dtype=float)
+            n = min(len(values), len(time_s))
+            valid_indices = np.flatnonzero(np.isfinite(values[:n]) & np.isfinite(time_s[:n]))
+            if not valid_indices.size:
+                sampled[name] = [None] * len(output_time)
+                continue
+            valid_time = time_s[valid_indices] - time_s[0]
+            positions = np.searchsorted(valid_time, output_time, side="right") - 1
+            output = np.full(len(output_time), np.nan)
+            available = positions >= 0
+            output[available] = values[valid_indices[positions[available]]]
+            sampled[name] = json_safe_values(output)
+        return sampled, target_rate_hz
+    if not source_rate_hz or target_rate_hz <= 0 or target_rate_hz >= source_rate_hz:
+        return {name: json_safe_values(values) for name, values in channels.items()}, source_rate_hz
+    stride = max(1, round(source_rate_hz / target_rate_hz))
+    sampled = {}
+    for name, values in channels.items():
+        values = np.asarray(values, dtype=float)
+        reduced = []
+        previous = np.nan
+        for start in range(0, len(values), stride):
+            valid = values[start:start + stride]
+            valid = valid[np.isfinite(valid)]
+            if valid.size:
+                previous = valid[-1]
+            reduced.append(previous)
+        sampled[name] = json_safe_values(reduced)
+    return sampled, source_rate_hz / stride
 
 
 def distance_from_gps(lat, lon, t, max_speed_mps):
@@ -419,6 +471,7 @@ def extract_from_csv(csv_path, proto_lut):
     derived, kpis, sources = compute_level2(df, t)
 
     channels = []
+    telemetry_channels = {}
     errors = []
     unresolved_names = []
 
@@ -458,6 +511,7 @@ def extract_from_csv(csv_path, proto_lut):
             "min": vmin, "max": vmax, "mean": vmean,
             "component": component_for(name, resolved),
         })
+        telemetry_channels[name] = vals
 
     # Derived Level 2 channels (speed_wheel_mps, power_W, distance_cum_km, ...)
     for name, d in derived.items():
@@ -482,6 +536,7 @@ def extract_from_csv(csv_path, proto_lut):
             "mean": round(float(np.mean(finite)), 4) if finite.size else None,
             "component": "Level 2 Derived",
         })
+        telemetry_channels[name] = vals
 
     if unresolved_names:
         errors.append(
@@ -501,6 +556,8 @@ def extract_from_csv(csv_path, proto_lut):
         "level": "Level2",
         "kpis": kpis,
         "level2_sources": sources,
+        "telemetry_channels": telemetry_channels,
+        "telemetry_time_s": t,
     }
 
 
@@ -680,6 +737,7 @@ def extract(mat_path: Path, proto_lut: dict) -> dict:
     keys = sorted(k for k in f.keys() if k not in skip)
 
     channels = []
+    telemetry_channels = {}
     errors = []
     unresolved_names = []
 
@@ -702,6 +760,7 @@ def extract(mat_path: Path, proto_lut: dict) -> dict:
             vmin = vmax = vmean = None
             if "signals" in g and "values" in g["signals"]:
                 vals = np.array(g["signals"]["values"][()]).flatten()
+                telemetry_channels[k] = vals
                 n = int(vals.size)
                 finite = vals[np.isfinite(vals)]
                 nan_pct = round(100 * (1 - finite.size / max(n, 1)), 2)
@@ -796,7 +855,25 @@ def extract(mat_path: Path, proto_lut: dict) -> dict:
         "extraction_errors": errors,  # surfaced by the web UI's error-flagging panel
         "level": "Level2" if level2 is not None else "Level1",
         "kpis": level2["kpis"] if level2 is not None else None,
+        "telemetry_channels": telemetry_channels,
     }
+
+
+def upsert_catalogue(catalogue_path: Path, run: dict):
+    """Atomically replace this run's metadata in the portable catalogue."""
+    if catalogue_path.exists():
+        try:
+            catalogue = json.loads(catalogue_path.read_text())
+        except json.JSONDecodeError as exc:
+            sys.exit(f"Catalogue is invalid JSON: {catalogue_path} ({exc})")
+    else:
+        catalogue = {"schema_version": 1, "runs": []}
+    catalogue.setdefault("schema_version", 1)
+    runs = catalogue.setdefault("runs", [])
+    catalogue["runs"] = [old for old in runs if old.get("id") != run["id"]] + [run]
+    temporary = catalogue_path.with_suffix(catalogue_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(catalogue, separators=(",", ":"), allow_nan=False))
+    temporary.replace(catalogue_path)
 
 
 def main():
@@ -806,13 +883,18 @@ def main():
                          ".csv file (Time + all channel columns) -- format is auto-detected by extension. "
                          "For .csv input, Level 2 KPIs are computed directly in Python (same algorithm as "
                          "LogFilter_Level2.m); no MATLAB step is needed.")
-    p.add_argument("-o", "--output", type=Path, default=None, help="Output JSON path (default: alongside input)")
+    p.add_argument("--catalogue", type=Path, default=Path("catalogue.json"),
+                   help="Catalogue JSON to update (default: catalogue.json)")
+    p.add_argument("--telemetry-dir", type=Path, default=Path("telemetry"),
+                   help="Directory for per-run telemetry files (default: telemetry)")
+    p.add_argument("--telemetry-rate", type=float, default=50.0,
+                   help="Graph sample rate in Hz (default: 50; use 0 to retain every source sample)")
     p.add_argument("--protocol", type=Path, default=None,
                     help="Path to fst.json (CAN protocol definition). Strongly recommended -- "
                          "without it, device/unit/component are guessed from channel name substrings only.")
-    p.add_argument("--event", required=True, help="Event name, e.g. 'FSPT Testing Day'")
-    p.add_argument("--session-type", required=True, help="Skidpad / Autocross / Endurance / Acceleration / Practice")
-    p.add_argument("--driver", required=True)
+    p.add_argument("--event", default="Uncategorised", help="Event name, e.g. 'FSPT Testing Day'")
+    p.add_argument("--session-type", default="Other", help="Skidpad / Autocross / Endurance / Acceleration / Practice")
+    p.add_argument("--driver", default="Unknown")
     p.add_argument("--date", default=None, help="YYYY-MM-DD (default: parsed from filename if possible)")
     p.add_argument("--time", default=None, help="HH:MM (default: parsed from filename if possible)")
     p.add_argument("--aeropack", action="store_true", help="Flag if aeropack was fitted")
@@ -845,8 +927,21 @@ def main():
     else:
         sys.exit(f"Unrecognized file extension '{suffix}'. Expected .mat or .csv.")
 
+    run_id = f"run-{stem}"
+    telemetry_path = args.telemetry_dir / f"{run_id}.json"
+    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+    telemetry_channels, telemetry_rate = downsample_channels(
+        extracted.pop("telemetry_channels", {}), extracted["sample_rate_hz"], args.telemetry_rate,
+        extracted.pop("telemetry_time_s", None))
+    telemetry = {
+        "schema_version": 1,
+        "sample_rate": telemetry_rate,
+        "channels": telemetry_channels,
+    }
+    telemetry_path.write_text(json.dumps(telemetry, separators=(",", ":"), allow_nan=False))
+
     run = {
-        "id": f"run-{stem}",
+        "id": run_id,
         "file": args.input_file.name,
         "date": date or "unknown",
         "time": time or "unknown",
@@ -860,20 +955,34 @@ def main():
             "arb": args.arb,
             "class": args.car_class,
         },
+        # Mirrors the shared manual test-log categories. These are deliberately
+        # present even when blank so the browser can show what still needs to
+        # be recorded for a comparable run.
+        "manual_log": {
+            "location": None, "objective": None, "laps": None, "best_lap_time": None,
+            "tyres": None, "tyre_pressures": None, "damper_setup": None,
+            "arb_position": args.arb, "torque_vectoring_map": None, "regen_map": None,
+            "torque_limits": None, "battery_used": None, "non_operational_signals": None,
+            "issues": None, "driver_feedback": None, "weather": None,
+            "track_conditions": None, "ambient_temp": None, "grip": None,
+        },
         "duration_s": extracted["duration_s"],
         "sample_rate_hz": extracted["sample_rate_hz"],
         "n_channels": extracted["n_channels"],
         "n_unresolved": extracted["n_unresolved"],
+        # Channel descriptors are catalogue metadata (not sample arrays). They
+        # make global channel/component/device search and quality flagging
+        # possible without loading a run's telemetry file.
         "channels": extracted["channels"],
+        "channel_names": [channel["key"] for channel in extracted["channels"]],
         "extraction_errors": extracted["extraction_errors"],
         "level": extracted["level"],
         "kpis": extracted["kpis"],
+        "telemetry_file": telemetry_path.as_posix(),
     }
+    upsert_catalogue(args.catalogue, run)
 
-    out_path = args.output or args.input_file.with_suffix(".catalogue.json")
-    out_path.write_text(json.dumps(run))
-
-    print(f"Wrote {out_path}  ({extracted['n_channels']} channels, "
+    print(f"Updated {args.catalogue}; wrote {telemetry_path}  ({extracted['n_channels']} channels, "
           f"{len(extracted['extraction_errors'])} extraction errors, "
           f"level={extracted['level']})")
     if extracted["kpis"]:
@@ -890,7 +999,7 @@ def main():
         print("Errors:")
         for e in extracted["extraction_errors"]:
             print(f"  - {e}")
-    print("\nNext step: open the web catalogue -> 'Add Run' -> upload this JSON file.")
+    print("\nNext step: serve this folder and open index.html. The browser will lazy-load telemetry only when a run is opened.")
 
 
 if __name__ == "__main__":

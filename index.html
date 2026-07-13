@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FST Lisboa — Telemetry</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><div><h1>FST Lisboa <span>/ telemetry</span></h1><p>Run catalogue and telemetry workspace</p></div><div id="status" role="status">Loading catalogue…</div></header>
+  <main>
+    <aside><label>Search runs or channels<input id="search" placeholder="Driver, event, channel…"></label><label>Event<select id="eventFilter"><option value="">All events</option></select></label><label>Driver<select id="driverFilter"><option value="">All drivers</option></select></label><label>Session<select id="sessionFilter"><option value="">All sessions</option></select></label><button id="clearFilters" class="quiet">Clear filters</button><hr><div id="summary"></div></aside>
+    <section class="catalogue"><div class="section-heading"><div><p class="eyebrow">Catalogue</p><h2 id="resultCount">Runs</h2></div><button id="compareButton" disabled>Compare selected (0)</button></div><div id="runList" class="run-list"></div></section>
+    <section class="workspace" id="workspace"><div class="empty-workspace">Choose a run to open its telemetry workspace.</div></section>
+  </main>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
