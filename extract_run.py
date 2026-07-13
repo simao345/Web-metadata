@@ -24,6 +24,24 @@ Usage (.csv input -- computes Level 2 KPIs directly, no MATLAB needed):
 Requirements:
     pip install numpy pandas --break-system-packages   (for .csv input)
     pip install h5py --break-system-packages            (for .mat input)
+
+What it does:
+    - Reads every channel (from .mat groups or CSV columns), pulling name/device
+    - Computes per-channel stats: n_samples, % missing (NaN), min/max/mean
+    - Resolves each channel's real CAN device/unit against the protocol (fst.json)
+    - For .mat input: if the file already contains a level2Info struct (i.e. it
+      was produced by LogFilter_Level2.m), passes through the exact KPI values
+      MATLAB computed, unchanged.
+    - For .csv input: computes the Level 2 KPIs itself, directly in Python,
+      using the SAME algorithm as LogFilter_Level2.m (same wheel-speed formula,
+      same GPS/RPM-fallback distance logic, same trapezoidal energy
+      integration) -- this is a faithful port, not an approximation, and
+      removes the need to run MATLAB at all.
+    - Either way, KPIs come with the same fault-plan fields (status, method,
+      failure_reason) so the web UI can show exactly why a KPI succeeded or
+      failed rather than silently guessing.
+    - Buckets each channel into a coarse "component" group for catalogue search
+    - Writes one JSON file: {metadata fields..., channels: [...], kpis: {...}}
 """
 
 import argparse
@@ -245,7 +263,7 @@ def compute_level2(df, t):
         if v_col and i_col:
             power_W = df[v_col].to_numpy(dtype=float) * df[i_col].to_numpy(dtype=float)
             energy_method = (f"Power from {v_col} .* {i_col}; "
-                             f"consumed energy = trapz(max(power_W,0), time) / 3600")
+                              f"consumed energy = trapz(max(power_W,0), time) / 3600")
             energy_required_channels = [v_col, i_col]
             energy_status = "ok"
         else:
@@ -284,7 +302,7 @@ def compute_level2(df, t):
             energy_per_km_failure = "Invalid distance or energy value."
     else:
         energy_per_km_failure = (f"Cannot compute Wh/km because distance status is {distance_status} "
-                                 f"and energy status is {energy_status}.")
+                                  f"and energy status is {energy_status}.")
 
     # ---- KPI 4: duration ----
     duration_status = "ok" if np.isfinite(run_duration_s) and run_duration_s > 0 else "failed"
@@ -301,37 +319,80 @@ def compute_level2(df, t):
         "run_duration_s": make_kpi(run_duration_s, "s", duration_status, "time(end) - time(1)",
                                     ["Time"], duration_failure),
         "regen_energy_Wh": make_kpi(regen_energy_Wh, "Wh", energy_status,
-                                    "trapz(max(-power_W,0), time) / 3600",
-                                    energy_required_channels, energy_failure),
+                                     "trapz(max(-power_W,0), time) / 3600",
+                                     energy_required_channels, energy_failure),
     }
 
     return derived, kpis, sources
 
 
-def estimate_signal_period(t, vals, fallback_dt):
-    """Reverse-engineers a signal's arrival period by checking consecutive
-    intervals where values change or reappear.
+def estimate_signal_period(time_array, values, fallback_dt):
+    """Estimate the actual update period of a signal by detecting when values change.
+    
+    For CAN signals that may be forward-filled or have lower frequency than the
+    base sampling rate, this detects the true update frequency.
+    
+    Returns the estimated period in seconds (or fallback_dt if detection fails).
     """
+    vals = np.asarray(values, dtype=float)
+    t = np.asarray(time_array, dtype=float)
+    
+    # Get indices where values are finite
     finite_mask = np.isfinite(vals)
+    if np.sum(finite_mask) < 2:
+        return fallback_dt
+    
     t_finite = t[finite_mask]
     vals_finite = vals[finite_mask]
+    
+    # Method 1: Find where values actually change (for forward-filled signals)
+    if len(vals_finite) > 1:
+        changes = np.diff(vals_finite) != 0
+        change_indices = np.where(changes)[0] + 1
+        if len(change_indices) > 1:
+            change_times = t_finite[change_indices]
+            dt = np.median(np.diff(change_times))
+            if dt > 0:
+                return float(dt)
+    
+    # Method 2: Use time gaps between finite samples
+    if len(t_finite) > 1:
+        dt_gaps = np.diff(t_finite)
+        dt = np.median(dt_gaps[dt_gaps > 0])  # ignore zero gaps
+        if dt > 0:
+            return float(dt)
+    
+    return fallback_dt
 
-    if len(t_finite) < 2:
-        return fallback_dt
 
-    # If forward-filled: trace when values actually change
-    changes = np.diff(vals_finite) != 0
-    update_indices = np.where(changes)[0] + 1
-    update_indices = np.concatenate(([0], update_indices))
-
-    if len(update_indices) > 1:
-        t_updates = t_finite[update_indices]
-        dt = np.median(np.diff(t_updates))
-        return float(dt) if dt > 0 else fallback_dt
-
-    # Otherwise fallback to distance between valid coordinates
-    dt = np.median(np.diff(t_finite))
-    return float(dt) if dt > 0 else fallback_dt
+def estimate_channel_nan_pct(time_array, values, signal_period):
+    """Calculate missing data percentage accounting for the channel's actual frequency.
+    
+    Calculates expected samples based on signal_period, then reports what % of
+    expected samples are actually missing (NaN).
+    """
+    vals = np.asarray(values, dtype=float)
+    t = np.asarray(time_array, dtype=float)
+    
+    if len(t) < 2 or signal_period <= 0:
+        # Fallback: basic NaN percentage
+        finite = vals[np.isfinite(vals)]
+        return round(100 * (1 - finite.size / max(vals.size, 1)), 2)
+    
+    # Expected number of samples at this frequency
+    duration = t[-1] - t[0]
+    expected_samples = int(duration / signal_period) + 1
+    
+    # Actual finite samples
+    finite = vals[np.isfinite(vals)]
+    actual_finite = finite.size
+    
+    # Missing as a percentage of expected
+    if expected_samples > 0:
+        missing_pct = 100 * (1 - actual_finite / expected_samples)
+        return round(max(0, min(100, missing_pct)), 2)  # clamp to [0, 100]
+    
+    return 0.0
 
 
 def extract_from_csv(csv_path, proto_lut):
@@ -366,13 +427,16 @@ def extract_from_csv(csv_path, proto_lut):
         vals = df[name].to_numpy(dtype=float)
         n = vals.size
         finite = vals[np.isfinite(vals)]
-        nan_pct = round(100 * (1 - finite.size / max(n, 1)), 2)
+        
+        # Estimate the actual signal period (accounting for lower-frequency channels)
+        signal_period = estimate_signal_period(t, vals, dt_ref)
+        
+        # Calculate nan_pct based on expected samples at this frequency
+        nan_pct = estimate_channel_nan_pct(t, vals, signal_period)
+        
         vmin = round(float(np.min(finite)), 4) if finite.size else None
         vmax = round(float(np.max(finite)), 4) if finite.size else None
         vmean = round(float(np.mean(finite)), 4) if finite.size else None
-
-        # Reverse engineer period via sample deltas
-        signal_period = estimate_signal_period(t, vals, fallback_dt=dt_ref)
 
         resolved, matched_base = resolve_signal(name, proto_lut)
         if resolved is None:
@@ -399,6 +463,11 @@ def extract_from_csv(csv_path, proto_lut):
     for name, d in derived.items():
         vals = d["values"]
         finite = vals[np.isfinite(vals)]
+        
+        # Derived channels are at the base sample rate
+        signal_period = dt_ref
+        nan_pct = estimate_channel_nan_pct(t, vals, signal_period)
+        
         channels.append({
             "key": name, "name": name, "type": "double",
             "device": "Level2 (derived)", "device_resolved": True,
@@ -407,7 +476,7 @@ def extract_from_csv(csv_path, proto_lut):
             "mat_tool_tag": "Level2",
             "period_s": round(dt_ref, 5),
             "n_samples": vals.size,
-            "nan_pct": round(100 * (1 - finite.size / max(vals.size, 1)), 2),
+            "nan_pct": nan_pct,
             "min": round(float(np.min(finite)), 4) if finite.size else None,
             "max": round(float(np.max(finite)), 4) if finite.size else None,
             "mean": round(float(np.mean(finite)), 4) if finite.size else None,
@@ -436,6 +505,7 @@ def extract_from_csv(csv_path, proto_lut):
 
 
 # Device name -> human-readable component label, for catalogue grouping/search.
+# Keys must match the "name" field of each device in the protocol JSON (fst.json).
 DEVICE_LABELS = {
     "iib": "Inverter Interface Board", "dash": "Dashboard", "se": "Sensors/Electronics",
     "te": "Throttle/Brake Plausibility", "master": "BMS Master", "telemetry": "Telemetry",
@@ -447,6 +517,9 @@ DEVICE_LABELS = {
     "fdu": "Front Drive Unit", "netas": "ETAS (network)", "strain_gauges": "Strain Gauge",
 }
 
+# Fallback substring rules ONLY for channels that can't be resolved against the
+# protocol (fst.json) at all -- e.g. debug/internal fields not in any device's
+# signal list. These are last-resort guesses and are flagged as such.
 FALLBACK_COMPONENT_RULES = [
     ("amk", "Inverters/Motors"), ("inv_", "Inverters/Motors"), ("ebs", "EBS / Autonomous Braking"),
     ("as_", "Autonomous System"), ("master_", "BMS Master"), ("cell_", "Battery Cells"),
@@ -462,11 +535,22 @@ FALLBACK_COMPONENT_RULES = [
 
 
 def load_protocol(proto_path):
+    """Load fst.json (CAN protocol definition) and build a signal-name lookup.
+
+    Returns a dict: signal_name -> {device, unit, scale, offset, min_value,
+    max_value, message, frequency_ms}. Muxed signals (e.g. per-corner motor
+    values) are stored once under their base name; the caller is responsible
+    for stripping numeric suffixes added by fcp-data-muncher when it expands
+    a muxed signal into N separate logged channels.
+    """
     if proto_path is None:
-        print("WARNING: no --protocol given. Every channel will be labeled 'Unresolved'.", file=sys.stderr)
+        print("WARNING: no --protocol given. Every channel will be labeled "
+              "'Unresolved' since there's nothing to match against. "
+              "Pass --protocol path/to/fst.json.", file=sys.stderr)
         return {}
     if not Path(proto_path).exists():
-        print(f"WARNING: --protocol path does not exist: {proto_path}.", file=sys.stderr)
+        print(f"WARNING: --protocol path does not exist: {proto_path}. "
+              "Every channel will be labeled 'Unresolved'. Check the path.", file=sys.stderr)
         return {}
     proto = json.loads(Path(proto_path).read_text())
     lut = {}
@@ -485,10 +569,21 @@ def load_protocol(proto_path):
                     "message": msg_key,
                     "frequency_ms": freq,
                 }
+    if not lut:
+        print(f"WARNING: --protocol file {proto_path} parsed but contained "
+              "zero signals. Every channel will be labeled 'Unresolved'. "
+              "Check the file isn't empty/malformed.", file=sys.stderr)
     return lut
 
 
 def resolve_signal(name, proto_lut):
+    """Resolve a logged channel name against the protocol lookup.
+
+    Tries an exact match first, then strips a trailing numeric suffix
+    (handles muxed signals like amk_actual_speed0..3 expanded by the
+    data-muncher from a single protocol-defined signal). Returns
+    (meta_dict_or_None, matched_name_or_None).
+    """
     if name in proto_lut:
         return proto_lut[name], name
     stripped = re.sub(r'\d+$', '', name)
@@ -516,6 +611,7 @@ def decode_uint16_str(ds) -> str:
 
 
 def read_cellstr(f, ds):
+    """Read a MATLAB cell array of strings (stored as HDF5 object references)."""
     out = []
     try:
         refs = np.array(ds[()]).flatten()
@@ -536,6 +632,13 @@ def read_scalar_num(ds):
 
 
 def extract_level2_kpis(f):
+    """Parse the level2Info struct written by LogFilter_Level2.m, if present.
+
+    Returns None if this .mat is Level 1 only (no level2Info group). Each KPI
+    is returned with the same fault-plan fields the MATLAB script produces:
+    value, unit, status, method, required_channels, failure_reason -- so the
+    web UI can display exactly what MATLAB computed, with no re-derivation.
+    """
     if "level2Info" not in f:
         return None
 
@@ -585,6 +688,10 @@ def extract(mat_path: Path, proto_lut: dict) -> dict:
         try:
             name = decode_uint16_str(g["Channelname"]) or k
             ctype = decode_uint16_str(g["Channeltype"]) if "Channeltype" in g else ""
+            # NOTE: the 'device' group in the .mat file is the name of the
+            # conversion tool (e.g. 'fcp-data-muncher'), NOT the CAN device
+            # that produced the signal. The real device comes from resolving
+            # the channel name against the protocol (fst.json) below.
             mat_tool_tag = decode_uint16_str(g["device"]) if "device" in g else ""
 
             period = None
@@ -605,6 +712,11 @@ def extract(mat_path: Path, proto_lut: dict) -> dict:
 
             resolved, matched_base = resolve_signal(name, proto_lut)
 
+            # Channels added by LogFilter_Level2.m (speed_wheel_mps, power_W,
+            # distance_cum_km, etc.) are tagged device='Level2' directly and
+            # carry their own literal 'unit' field -- they won't (and
+            # shouldn't) be found in the CAN protocol, so treat that as
+            # expected rather than flagging them as unresolved.
             is_level2_derived = (mat_tool_tag == "Level2")
             if is_level2_derived:
                 own_unit = decode_uint16_str(g["unit"]) if "unit" in g else ""
@@ -643,6 +755,7 @@ def extract(mat_path: Path, proto_lut: dict) -> dict:
         except Exception as e:
             errors.append(f"Channel '{k}' failed to extract: {e}")
 
+    # Sample rate / duration from resampleInfo, fallback to first channel's period
     sample_rate_hz, duration_s = None, None
     if "resampleInfo" in f:
         ri = f["resampleInfo"]
@@ -659,9 +772,20 @@ def extract(mat_path: Path, proto_lut: dict) -> dict:
     if duration_s is None and channels:
         longest = max(channels, key=lambda c: c["n_samples"])
         if longest["period_s"] and longest["n_samples"]:
-            duration_s = longest["period_s"] * longest["n_samples"]
+            duration_s = round(longest["period_s"] * (longest["n_samples"] - 1), 3)
+    if sample_rate_hz is None and duration_s and channels:
+        longest = max(channels, key=lambda c: c["n_samples"])
+        sample_rate_hz = round(longest["n_samples"] / duration_s, 3) if duration_s else None
 
-    l2_data = extract_level2_kpis(f)
+    if unresolved_names:
+        errors.append(
+            f"{len(unresolved_names)} channel(s) could not be matched against the "
+            f"protocol (fst.json) and were labeled 'Unresolved': "
+            f"{', '.join(unresolved_names[:15])}"
+            f"{'...' if len(unresolved_names) > 15 else ''}"
+        )
+
+    level2 = extract_level2_kpis(f)
 
     return {
         "channels": channels,
@@ -669,61 +793,104 @@ def extract(mat_path: Path, proto_lut: dict) -> dict:
         "n_unresolved": len(unresolved_names),
         "duration_s": round(duration_s, 3) if duration_s else None,
         "sample_rate_hz": round(sample_rate_hz, 3) if sample_rate_hz else None,
-        "extraction_errors": errors,
-        "level": "Level2" if l2_data else "Level1",
-        "kpis": l2_data["kpis"] if l2_data else {},
-        "level2_meta": l2_data["meta"] if l2_data else {},
+        "extraction_errors": errors,  # surfaced by the web UI's error-flagging panel
+        "level": "Level2" if level2 is not None else "Level1",
+        "kpis": level2["kpis"] if level2 is not None else None,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract telemetry data to Run Catalogue JSON schema.")
-    parser.add_argument("input_file", help="Path to a resampled .mat file or Level 1 CSV.")
-    parser.add_argument("-o", "--output", help="Output path for the generated JSON.")
-    parser.add_argument("--event", default="Unknown Event")
-    parser.add_argument("--session-type", default="Testing")
-    parser.add_argument("--driver", default="Unknown Driver")
-    parser.add_argument("--class", dest="car_class", default="Class 1 EV")
-    parser.add_argument("--origin", default="real")
-    parser.add_argument("--protocol", help="Path to fst.json protocol file.")
-    parser.add_argument("--aeropack", action="store_true")
-    parser.add_argument("--springs", default="Medium")
-    parser.add_argument("--arb", default="Medium")
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("input_file", type=Path,
+                    help="Path to a *_resampled.mat file (h5py/HDF5 path) OR a Level 1 wide-format "
+                         ".csv file (Time + all channel columns) -- format is auto-detected by extension. "
+                         "For .csv input, Level 2 KPIs are computed directly in Python (same algorithm as "
+                         "LogFilter_Level2.m); no MATLAB step is needed.")
+    p.add_argument("-o", "--output", type=Path, default=None, help="Output JSON path (default: alongside input)")
+    p.add_argument("--protocol", type=Path, default=None,
+                    help="Path to fst.json (CAN protocol definition). Strongly recommended -- "
+                         "without it, device/unit/component are guessed from channel name substrings only.")
+    p.add_argument("--event", required=True, help="Event name, e.g. 'FSPT Testing Day'")
+    p.add_argument("--session-type", required=True, help="Skidpad / Autocross / Endurance / Acceleration / Practice")
+    p.add_argument("--driver", required=True)
+    p.add_argument("--date", default=None, help="YYYY-MM-DD (default: parsed from filename if possible)")
+    p.add_argument("--time", default=None, help="HH:MM (default: parsed from filename if possible)")
+    p.add_argument("--aeropack", action="store_true", help="Flag if aeropack was fitted")
+    p.add_argument("--springs", default="Unknown", help="Spring rate setup, e.g. Soft/Medium/Stiff")
+    p.add_argument("--arb", default="Unknown", help="Anti-roll bar setup")
+    p.add_argument("--class", dest="car_class", default="Class 1 EV")
+    p.add_argument("--origin", choices=["real", "synthetic"], default="real")
+    args = p.parse_args()
 
-    args = parser.parse_args()
-    input_path = Path(args.input_file)
+    if not args.input_file.exists():
+        sys.exit(f"File not found: {args.input_file}")
 
-    if not input_path.exists():
-        sys.exit(f"Input file not found: {input_path}")
+    date, time = args.date, args.time
+    stem = args.input_file.stem
+    if (date is None or time is None) and "_" in stem:
+        parts = stem.split("_")
+        if len(parts) >= 2:
+            date = date or parts[0]
+            time = time or parts[1].replace("-", ":")
 
     proto_lut = load_protocol(args.protocol)
+    suffix = args.input_file.suffix.lower()
 
-    if input_path.suffix.lower() == ".csv":
-        out_data = extract_from_csv(input_path, proto_lut)
-    elif input_path.suffix.lower() == ".mat":
+    if suffix == ".csv":
+        extracted = extract_from_csv(args.input_file, proto_lut)
+    elif suffix == ".mat":
         if h5py is None:
             sys.exit("Missing dependency: pip install h5py --break-system-packages")
-        out_data = extract(input_path, proto_lut)
+        extracted = extract(args.input_file, proto_lut)
     else:
-        sys.exit("Unsupported file extension. Must be .csv or .mat")
+        sys.exit(f"Unrecognized file extension '{suffix}'. Expected .mat or .csv.")
 
-    # Construct the metadata block for Run Catalogue interface
-    payload = {
+    run = {
+        "id": f"run-{stem}",
+        "file": args.input_file.name,
+        "date": date or "unknown",
+        "time": time or "unknown",
         "event": args.event,
         "session_type": args.session_type,
         "driver": args.driver,
-        "car_class": args.car_class,
         "origin": args.origin,
-        "aeropack": args.aeropack,
-        "setup_springs": args.springs,
-        "setup_arb": args.arb,
-        "filename": input_path.name,
-        **out_data
+        "config": {
+            "aeropack": bool(args.aeropack),
+            "spring_rate": args.springs,
+            "arb": args.arb,
+            "class": args.car_class,
+        },
+        "duration_s": extracted["duration_s"],
+        "sample_rate_hz": extracted["sample_rate_hz"],
+        "n_channels": extracted["n_channels"],
+        "n_unresolved": extracted["n_unresolved"],
+        "channels": extracted["channels"],
+        "extraction_errors": extracted["extraction_errors"],
+        "level": extracted["level"],
+        "kpis": extracted["kpis"],
     }
 
-    output_path = args.output or input_path.with_suffix(".json")
-    Path(output_path).write_text(json.dumps(payload, indent=2))
-    print(f"Successfully generated payload structure metadata at: {output_path}")
+    out_path = args.output or args.input_file.with_suffix(".catalogue.json")
+    out_path.write_text(json.dumps(run))
+
+    print(f"Wrote {out_path}  ({extracted['n_channels']} channels, "
+          f"{len(extracted['extraction_errors'])} extraction errors, "
+          f"level={extracted['level']})")
+    if extracted["kpis"]:
+        print("\nKPIs:")
+        for name, k in extracted["kpis"].items():
+            if k["status"] == "ok":
+                print(f"  {name:30s} = {k['value']:.4g} {k['unit']}")
+            else:
+                print(f"  {name:30s} = FAILED | {k['failure_reason']}")
+    elif extracted["level"] == "Level1":
+        print("\nNo level2Info found -- this is a Level 1 file. "
+              "Run LogFilter_Level2.m first to get KPIs.")
+    if extracted["extraction_errors"]:
+        print("Errors:")
+        for e in extracted["extraction_errors"]:
+            print(f"  - {e}")
+    print("\nNext step: open the web catalogue -> 'Add Run' -> upload this JSON file.")
 
 
 if __name__ == "__main__":
