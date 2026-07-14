@@ -1,4 +1,114 @@
 #!/usr/bin/env python3
+argument("--driver", default="Unknown")
+    p.add_argument("--date", default=None, help="YYYY-MM-DD (default: parsed from filename if possible)")
+    p.add_argument("--time", default=None, help="HH:MM (default: parsed from filename if possible)")
+    p.add_argument("--aeropack", action="store_true", help="Flag if aeropack was fitted")
+    p.add_argument("--springs", default="Unknown", help="Spring rate setup, e.g. Soft/Medium/Stiff")
+    p.add_argument("--arb", default="Unknown", help="Anti-roll bar setup")
+    p.add_argument("--class", dest="car_class", default="Class 1 EV")
+    p.add_argument("--origin", choices=["real", "synthetic"], default="real")
+    args = p.parse_args()
+
+    if not args.input_file.exists():
+        sys.exit(f"File not found: {args.input_file}")
+
+    date, time = args.date, args.time
+    stem = args.input_file.stem
+    if (date is None or time is None) and "_" in stem:
+        parts = stem.split("_")
+        if len(parts) >= 2:
+            date = date or parts[0]
+            time = time or parts[1].replace("-", ":")
+
+    proto_lut = load_protocol(args.protocol)
+    suffix = args.input_file.suffix.lower()
+
+    if suffix == ".csv":
+        extracted = extract_from_csv(args.input_file, proto_lut)
+    elif suffix == ".mat":
+        if h5py is None:
+            sys.exit("Missing dependency: pip install h5py --break-system-packages")
+        extracted = extract(args.input_file, proto_lut)
+    else:
+        sys.exit(f"Unrecognized file extension '{suffix}'. Expected .mat or .csv.")
+
+    run_id = f"run-{stem}"
+    telemetry_path = args.telemetry_dir / f"{run_id}.json"
+    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+    telemetry_channels, telemetry_rate = downsample_channels(
+        extracted.pop("telemetry_channels", {}), extracted["sample_rate_hz"], args.telemetry_rate,
+        extracted.pop("telemetry_time_s", None))
+    telemetry = {
+        "schema_version": 1,
+        "sample_rate": telemetry_rate,
+        "channels": telemetry_channels,
+    }
+    telemetry_path.write_text(json.dumps(telemetry, separators=(",", ":"), allow_nan=False))
+
+    run = {
+        "id": run_id,
+        "file": args.input_file.name,
+        "date": date or "unknown",
+        "time": time or "unknown",
+        "event": args.event,
+        "session_type": args.session_type,
+        "driver": args.driver,
+        "origin": args.origin,
+        "config": {
+            "aeropack": bool(args.aeropack),
+            "spring_rate": args.springs,
+            "arb": args.arb,
+            "class": args.car_class,
+        },
+        # Mirrors the shared manual test-log categories. These are deliberately
+        # present even when blank so the browser can show what still needs to
+        # be recorded for a comparable run.
+        "manual_log": {
+            "location": None, "objective": None, "laps": None, "best_lap_time": None,
+            "tyres": None, "tyre_pressures": None, "damper_setup": None,
+            "arb_position": args.arb, "torque_vectoring_map": None, "regen_map": None,
+            "torque_limits": None, "battery_used": None, "non_operational_signals": None,
+            "issues": None, "driver_feedback": None, "weather": None,
+            "track_conditions": None, "ambient_temp": None, "grip": None,
+        },
+        "duration_s": extracted["duration_s"],
+        "sample_rate_hz": extracted["sample_rate_hz"],
+        "n_channels": extracted["n_channels"],
+        "n_unresolved": extracted["n_unresolved"],
+        # Channel descriptors are catalogue metadata (not sample arrays). They
+        # make global channel/component/device search and quality flagging
+        # possible without loading a run's telemetry file.
+        "channels": extracted["channels"],
+        "channel_names": [channel["key"] for channel in extracted["channels"]],
+        "extraction_errors": extracted["extraction_errors"],
+        "level": extracted["level"],
+        "kpis": extracted["kpis"],
+        "telemetry_file": telemetry_path.as_posix(),
+    }
+    upsert_catalogue(args.catalogue, run)
+
+    print(f"Updated {args.catalogue}; wrote {telemetry_path}  ({extracted['n_channels']} channels, "
+          f"{len(extracted['extraction_errors'])} extraction errors, "
+          f"level={extracted['level']})")
+    if extracted["kpis"]:
+        print("\nKPIs:")
+        for name, k in extracted["kpis"].items():
+            if k["status"] == "ok":
+                print(f"  {name:30s} = {k['value']:.4g} {k['unit']}")
+            else:
+                print(f"  {name:30s} = FAILED | {k['failure_reason']}")
+    elif extracted["level"] == "Level1":
+        print("\nNo level2Info found -- this is a Level 1 file. "
+              "Run LogFilter_Level2.m first to get KPIs.")
+    if extracted["extraction_errors"]:
+        print("Errors:")
+        for e in extracted["extraction_errors"]:
+            print(f"  - {e}")
+    print("\nNext step: serve this folder and open index.html. The browser will lazy-load telemetry only when a run is opened.")
+
+
+if __name__ == "__main__":
+    main()
 """
 extract_run.py
 
@@ -894,113 +1004,4 @@ def main():
                          "without it, device/unit/component are guessed from channel name substrings only.")
     p.add_argument("--event", default="Uncategorised", help="Event name, e.g. 'FSPT Testing Day'")
     p.add_argument("--session-type", default="Other", help="Skidpad / Autocross / Endurance / Acceleration / Practice")
-    p.add_argument("--driver", default="Unknown")
-    p.add_argument("--date", default=None, help="YYYY-MM-DD (default: parsed from filename if possible)")
-    p.add_argument("--time", default=None, help="HH:MM (default: parsed from filename if possible)")
-    p.add_argument("--aeropack", action="store_true", help="Flag if aeropack was fitted")
-    p.add_argument("--springs", default="Unknown", help="Spring rate setup, e.g. Soft/Medium/Stiff")
-    p.add_argument("--arb", default="Unknown", help="Anti-roll bar setup")
-    p.add_argument("--class", dest="car_class", default="Class 1 EV")
-    p.add_argument("--origin", choices=["real", "synthetic"], default="real")
-    args = p.parse_args()
-
-    if not args.input_file.exists():
-        sys.exit(f"File not found: {args.input_file}")
-
-    date, time = args.date, args.time
-    stem = args.input_file.stem
-    if (date is None or time is None) and "_" in stem:
-        parts = stem.split("_")
-        if len(parts) >= 2:
-            date = date or parts[0]
-            time = time or parts[1].replace("-", ":")
-
-    proto_lut = load_protocol(args.protocol)
-    suffix = args.input_file.suffix.lower()
-
-    if suffix == ".csv":
-        extracted = extract_from_csv(args.input_file, proto_lut)
-    elif suffix == ".mat":
-        if h5py is None:
-            sys.exit("Missing dependency: pip install h5py --break-system-packages")
-        extracted = extract(args.input_file, proto_lut)
-    else:
-        sys.exit(f"Unrecognized file extension '{suffix}'. Expected .mat or .csv.")
-
-    run_id = f"run-{stem}"
-    telemetry_path = args.telemetry_dir / f"{run_id}.json"
-    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-    telemetry_channels, telemetry_rate = downsample_channels(
-        extracted.pop("telemetry_channels", {}), extracted["sample_rate_hz"], args.telemetry_rate,
-        extracted.pop("telemetry_time_s", None))
-    telemetry = {
-        "schema_version": 1,
-        "sample_rate": telemetry_rate,
-        "channels": telemetry_channels,
-    }
-    telemetry_path.write_text(json.dumps(telemetry, separators=(",", ":"), allow_nan=False))
-
-    run = {
-        "id": run_id,
-        "file": args.input_file.name,
-        "date": date or "unknown",
-        "time": time or "unknown",
-        "event": args.event,
-        "session_type": args.session_type,
-        "driver": args.driver,
-        "origin": args.origin,
-        "config": {
-            "aeropack": bool(args.aeropack),
-            "spring_rate": args.springs,
-            "arb": args.arb,
-            "class": args.car_class,
-        },
-        # Mirrors the shared manual test-log categories. These are deliberately
-        # present even when blank so the browser can show what still needs to
-        # be recorded for a comparable run.
-        "manual_log": {
-            "location": None, "objective": None, "laps": None, "best_lap_time": None,
-            "tyres": None, "tyre_pressures": None, "damper_setup": None,
-            "arb_position": args.arb, "torque_vectoring_map": None, "regen_map": None,
-            "torque_limits": None, "battery_used": None, "non_operational_signals": None,
-            "issues": None, "driver_feedback": None, "weather": None,
-            "track_conditions": None, "ambient_temp": None, "grip": None,
-        },
-        "duration_s": extracted["duration_s"],
-        "sample_rate_hz": extracted["sample_rate_hz"],
-        "n_channels": extracted["n_channels"],
-        "n_unresolved": extracted["n_unresolved"],
-        # Channel descriptors are catalogue metadata (not sample arrays). They
-        # make global channel/component/device search and quality flagging
-        # possible without loading a run's telemetry file.
-        "channels": extracted["channels"],
-        "channel_names": [channel["key"] for channel in extracted["channels"]],
-        "extraction_errors": extracted["extraction_errors"],
-        "level": extracted["level"],
-        "kpis": extracted["kpis"],
-        "telemetry_file": telemetry_path.as_posix(),
-    }
-    upsert_catalogue(args.catalogue, run)
-
-    print(f"Updated {args.catalogue}; wrote {telemetry_path}  ({extracted['n_channels']} channels, "
-          f"{len(extracted['extraction_errors'])} extraction errors, "
-          f"level={extracted['level']})")
-    if extracted["kpis"]:
-        print("\nKPIs:")
-        for name, k in extracted["kpis"].items():
-            if k["status"] == "ok":
-                print(f"  {name:30s} = {k['value']:.4g} {k['unit']}")
-            else:
-                print(f"  {name:30s} = FAILED | {k['failure_reason']}")
-    elif extracted["level"] == "Level1":
-        print("\nNo level2Info found -- this is a Level 1 file. "
-              "Run LogFilter_Level2.m first to get KPIs.")
-    if extracted["extraction_errors"]:
-        print("Errors:")
-        for e in extracted["extraction_errors"]:
-            print(f"  - {e}")
-    print("\nNext step: serve this folder and open index.html. The browser will lazy-load telemetry only when a run is opened.")
-
-
-if __name__ == "__main__":
-    main()
+    p.add_
