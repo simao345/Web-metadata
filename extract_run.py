@@ -1,114 +1,4 @@
 #!/usr/bin/env python3
-argument("--driver", default="Unknown")
-    p.add_argument("--date", default=None, help="YYYY-MM-DD (default: parsed from filename if possible)")
-    p.add_argument("--time", default=None, help="HH:MM (default: parsed from filename if possible)")
-    p.add_argument("--aeropack", action="store_true", help="Flag if aeropack was fitted")
-    p.add_argument("--springs", default="Unknown", help="Spring rate setup, e.g. Soft/Medium/Stiff")
-    p.add_argument("--arb", default="Unknown", help="Anti-roll bar setup")
-    p.add_argument("--class", dest="car_class", default="Class 1 EV")
-    p.add_argument("--origin", choices=["real", "synthetic"], default="real")
-    args = p.parse_args()
-
-    if not args.input_file.exists():
-        sys.exit(f"File not found: {args.input_file}")
-
-    date, time = args.date, args.time
-    stem = args.input_file.stem
-    if (date is None or time is None) and "_" in stem:
-        parts = stem.split("_")
-        if len(parts) >= 2:
-            date = date or parts[0]
-            time = time or parts[1].replace("-", ":")
-
-    proto_lut = load_protocol(args.protocol)
-    suffix = args.input_file.suffix.lower()
-
-    if suffix == ".csv":
-        extracted = extract_from_csv(args.input_file, proto_lut)
-    elif suffix == ".mat":
-        if h5py is None:
-            sys.exit("Missing dependency: pip install h5py --break-system-packages")
-        extracted = extract(args.input_file, proto_lut)
-    else:
-        sys.exit(f"Unrecognized file extension '{suffix}'. Expected .mat or .csv.")
-
-    run_id = f"run-{stem}"
-    telemetry_path = args.telemetry_dir / f"{run_id}.json"
-    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-    telemetry_channels, telemetry_rate = downsample_channels(
-        extracted.pop("telemetry_channels", {}), extracted["sample_rate_hz"], args.telemetry_rate,
-        extracted.pop("telemetry_time_s", None))
-    telemetry = {
-        "schema_version": 1,
-        "sample_rate": telemetry_rate,
-        "channels": telemetry_channels,
-    }
-    telemetry_path.write_text(json.dumps(telemetry, separators=(",", ":"), allow_nan=False))
-
-    run = {
-        "id": run_id,
-        "file": args.input_file.name,
-        "date": date or "unknown",
-        "time": time or "unknown",
-        "event": args.event,
-        "session_type": args.session_type,
-        "driver": args.driver,
-        "origin": args.origin,
-        "config": {
-            "aeropack": bool(args.aeropack),
-            "spring_rate": args.springs,
-            "arb": args.arb,
-            "class": args.car_class,
-        },
-        # Mirrors the shared manual test-log categories. These are deliberately
-        # present even when blank so the browser can show what still needs to
-        # be recorded for a comparable run.
-        "manual_log": {
-            "location": None, "objective": None, "laps": None, "best_lap_time": None,
-            "tyres": None, "tyre_pressures": None, "damper_setup": None,
-            "arb_position": args.arb, "torque_vectoring_map": None, "regen_map": None,
-            "torque_limits": None, "battery_used": None, "non_operational_signals": None,
-            "issues": None, "driver_feedback": None, "weather": None,
-            "track_conditions": None, "ambient_temp": None, "grip": None,
-        },
-        "duration_s": extracted["duration_s"],
-        "sample_rate_hz": extracted["sample_rate_hz"],
-        "n_channels": extracted["n_channels"],
-        "n_unresolved": extracted["n_unresolved"],
-        # Channel descriptors are catalogue metadata (not sample arrays). They
-        # make global channel/component/device search and quality flagging
-        # possible without loading a run's telemetry file.
-        "channels": extracted["channels"],
-        "channel_names": [channel["key"] for channel in extracted["channels"]],
-        "extraction_errors": extracted["extraction_errors"],
-        "level": extracted["level"],
-        "kpis": extracted["kpis"],
-        "telemetry_file": telemetry_path.as_posix(),
-    }
-    upsert_catalogue(args.catalogue, run)
-
-    print(f"Updated {args.catalogue}; wrote {telemetry_path}  ({extracted['n_channels']} channels, "
-          f"{len(extracted['extraction_errors'])} extraction errors, "
-          f"level={extracted['level']})")
-    if extracted["kpis"]:
-        print("\nKPIs:")
-        for name, k in extracted["kpis"].items():
-            if k["status"] == "ok":
-                print(f"  {name:30s} = {k['value']:.4g} {k['unit']}")
-            else:
-                print(f"  {name:30s} = FAILED | {k['failure_reason']}")
-    elif extracted["level"] == "Level1":
-        print("\nNo level2Info found -- this is a Level 1 file. "
-              "Run LogFilter_Level2.m first to get KPIs.")
-    if extracted["extraction_errors"]:
-        print("Errors:")
-        for e in extracted["extraction_errors"]:
-            print(f"  - {e}")
-    print("\nNext step: serve this folder and open index.html. The browser will lazy-load telemetry only when a run is opened.")
-
-
-if __name__ == "__main__":
-    main()
 """
 extract_run.py
 
@@ -120,14 +10,24 @@ into a lightweight catalogue entry plus a separate, lazy-loaded telemetry JSON
 file for the FST Lisboa telemetry browser. Format is chosen automatically from
 the file extension.
 
-Usage (.mat input):
+`input_file` can also be a DIRECTORY, in which case every .csv/.mat file
+directly inside it is processed and upserted into the same catalogue
+(one telemetry JSON per run, as usual). Use --recursive to also descend
+into subdirectories.
+
+Usage (single .mat input):
     python3 extract_run.py path/to/run_resampled.mat \
         --event "FSPT Testing Day" --session-type "Autocross" --driver "Driver A" \
         --aeropack --springs Medium --arb Stiff --class "Class 1 EV" --origin real \
         --protocol fst.json
 
-Usage (.csv input -- computes Level 2 KPIs directly, no MATLAB needed):
+Usage (single .csv input -- computes Level 2 KPIs directly, no MATLAB needed):
     python3 extract_run.py path/to/run_level1.csv \
+        --event "FSPT Testing Day" --session-type "Autocross" --driver "Driver A" \
+        --protocol fst.json
+
+Usage (batch: every .csv/.mat in a directory):
+    python3 extract_run.py path/to/csv_folder \
         --event "FSPT Testing Day" --session-type "Autocross" --driver "Driver A" \
         --protocol fst.json
 
@@ -153,6 +53,24 @@ What it does:
     - Buckets each channel into a coarse "component" group for catalogue search
     - Updates catalogue.json and writes telemetry/<run-id>.json. The catalogue
       contains only searchable metadata; sample arrays are fetched on demand.
+    - When given a directory, repeats all of the above for every recognized
+      file inside it, upserting each run into the same catalogue.
+
+CSV MEMORY MODEL (read this if you're processing large logs):
+    The CSV path never loads the whole file into memory. It:
+      1. Reads only the header, plus a full-precision copy of Time and the
+         handful of "special" columns the Level 2 algorithm needs exactly
+         (wheel RPMs, GPS lat/lon, power/voltage/current) -- usually well
+         under 10 columns, regardless of how many channels the file has.
+      2. Streams the rest of the file in row-chunks (--chunk-rows, default
+         200,000 rows) via pandas' chunked reader, updating running
+         min/max/mean/nan-count and a downsampled display-telemetry array
+         PER CHANNEL as each chunk goes by, then discarding the chunk.
+    Peak memory therefore scales with (chunk_rows * n_channels) plus a few
+    full-length columns -- NOT with the size of the whole file. A file that
+    used to need tens of GB of RAM (and so got pushed into swap and hung/
+    crashed) now runs in a small, roughly constant footprint. If you still
+    see memory pressure, lower --chunk-rows.
 """
 
 import argparse
@@ -201,6 +119,22 @@ POWER_CANDIDATES = ["isa_power", "ISA_power", "isa_Power", "ISA_Power", "power_i
 VOLTAGE_CANDIDATES = ["isa_voltage", "ISA_voltage", "isa_Voltage", "ISA_Voltage", "voltage_isa", "Voltage_ISA"]
 CURRENT_CANDIDATES = ["isa_current", "ISA_current", "isa_Current", "ISA_Current", "current_isa", "Current_ISA"]
 
+# Cap on how many inter-update time-gaps we keep, per channel, for the
+# streaming period estimator below. Bounds memory for channels that toggle
+# on every single row; the median over this many samples is already a very
+# stable estimate of the true update period.
+CHANGE_SAMPLE_RESERVOIR = 500
+
+# Safety cap shared by both the offline (.mat) and streaming (.csv) display
+# telemetry builders -- refuses to allocate a per-channel output array bigger
+# than this, which is what protects against a corrupt/garbage Time column.
+MAX_OUTPUT_SAMPLES = 20_000_000
+
+# Rows per pandas chunk for the CSV streaming pass. Lower this (via
+# --chunk-rows) if you still see memory pressure on a very wide file
+# (many hundreds of channels); raise it for a bit more speed on a narrow one.
+DEFAULT_CHUNK_ROWS = 200_000
+
 
 def find_channel_flexible(columns, candidates):
     """Exact match first, then case-insensitive -- mirrors findChannelNameFlexible."""
@@ -241,6 +175,21 @@ def json_safe_values(values):
     return np.where(np.isfinite(values), values, None).tolist()
 
 
+def build_output_time_grid(duration_s, target_rate_hz):
+    """Shared by the offline (.mat) and streaming (.csv) telemetry builders:
+    the fixed, uniform display-time grid every channel gets resampled onto.
+    """
+    n_output = int(duration_s * target_rate_hz) + 2
+    if n_output > MAX_OUTPUT_SAMPLES:
+        raise MemoryError(
+            f"Refusing to build a telemetry grid of {n_output:,} samples per channel "
+            f"(duration_s={duration_s:.3f}, telemetry_rate={target_rate_hz}). Check the Time "
+            f"column for a corrupt/huge value, or lower --telemetry-rate if the run genuinely "
+            f"is this long."
+        )
+    return np.arange(0, duration_s + (0.5 / target_rate_hz), 1 / target_rate_hz)
+
+
 def downsample_channels(channels, source_rate_hz, target_rate_hz, time_s=None):
     """Return display telemetry at a bounded uniform rate, preserving sparse signals.
 
@@ -248,11 +197,16 @@ def downsample_channels(channels, source_rate_hz, target_rate_hz, time_s=None):
     repeatedly sample those holes. Instead, every display-time bin takes its
     last finite reading; if a device did not update during the bin, its last
     known value is held. Full-rate values are still used for KPI calculation.
+
+    NOTE: this offline version still requires each channel's full-rate array
+    in memory, which is fine for the .mat path (typically far fewer, already
+    resampled channels) but is exactly what the streaming CSV path (see
+    StreamingDownsampler below) avoids for wide, high-row-count files.
     """
     if time_s is not None and target_rate_hz > 0:
         time_s = np.asarray(time_s, dtype=float)
         duration_s = float(time_s[-1] - time_s[0])
-        output_time = np.arange(0, duration_s + (0.5 / target_rate_hz), 1 / target_rate_hz)
+        output_time = build_output_time_grid(duration_s, target_rate_hz)
         sampled = {}
         for name, values in channels.items():
             values = np.asarray(values, dtype=float)
@@ -286,35 +240,194 @@ def downsample_channels(channels, source_rate_hz, target_rate_hz, time_s=None):
     return sampled, source_rate_hz / stride
 
 
-def distance_from_gps(lat, lon, t, max_speed_mps):
-    n = min(len(lat), len(lon), len(t))
-    lat, lon, t = lat[:n], lon[:n], t[:n]
-    valid_point = np.isfinite(lat) & np.isfinite(lon) & (np.abs(lat) <= 90) & (np.abs(lon) <= 180)
-    quality = {"n_samples": n, "n_finite_latlon": int(valid_point.sum()),
-               "n_valid_segments": 0, "n_rejected_segments": 0, "max_segment_speed_mps": max_speed_mps}
-    if valid_point.sum() < 3:
-        return None, quality
+class StreamingDownsampler:
+    """Incrementally builds the same 'each display bin holds the last finite
+    value at-or-before it' telemetry that downsample_channels() computes
+    offline -- but a chunk at a time, so the full-rate channel never has to
+    exist in memory. Call update() once per chunk (in time order), then
+    finalize() once at the end.
+    """
 
-    R = 6371000.0
-    lat1, lat2 = np.radians(lat[:-1]), np.radians(lat[1:])
-    lon1, lon2 = np.radians(lon[:-1]), np.radians(lon[1:])
-    dlat, dlon = lat2 - lat1, lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    d = R * c
-    dt = np.diff(t)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        seg_speed = d / dt
-    valid_seg = (valid_point[:-1] & valid_point[1:] & np.isfinite(d) & np.isfinite(dt)
-                 & (dt > 0) & np.isfinite(seg_speed) & (seg_speed <= max_speed_mps))
-    quality["n_valid_segments"] = int(valid_seg.sum())
-    quality["n_rejected_segments"] = int(len(valid_seg) - valid_seg.sum())
-    d = np.where(valid_seg, d, 0.0)
-    return np.concatenate(([0.0], np.cumsum(d))), quality
+    def __init__(self, output_time):
+        self.output_time = output_time
+        self.values = np.full(len(output_time), np.nan)
+
+    def update(self, t_chunk_elapsed, v_chunk):
+        v = np.asarray(v_chunk, dtype=np.float64)
+        t = np.asarray(t_chunk_elapsed, dtype=np.float64)
+        finite = np.isfinite(v) & np.isfinite(t)
+        if not finite.any():
+            return
+        tf = t[finite]
+        vf = v[finite]
+        positions = np.searchsorted(self.output_time, tf, side="right") - 1
+        keep = positions >= 0
+        positions = positions[keep]
+        vf = vf[keep]
+        if positions.size:
+            # Chunks arrive in time order, so for repeated bins the later
+            # (later-in-time) write naturally wins -- matching "last known
+            # value" semantics, both within a chunk and across chunks.
+            self.values[positions] = vf
+
+    def finalize(self):
+        mask = np.isfinite(self.values)
+        if not mask.any():
+            return self.values
+        idx = np.where(mask, np.arange(len(self.values)), -1)
+        np.maximum.accumulate(idx, out=idx)
+        return np.where(idx >= 0, self.values[np.clip(idx, 0, None)], np.nan)
 
 
-def compute_level2(df, t):
-    """Runs the full LogFilter_Level2.m algorithm on a Level 1 dataframe.
+class RunningChannelStat:
+    """Accumulates one channel's n_samples/nan-count/min/max/mean and an
+    approximate update period across chunks, without ever holding the full
+    channel in memory. update() is called once per chunk.
+    """
+    __slots__ = ("count", "nan_count", "minv", "maxv", "total",
+                 "last_change_t", "change_gaps")
+
+    def __init__(self):
+        self.count = 0
+        self.nan_count = 0
+        self.minv = np.inf
+        self.maxv = -np.inf
+        self.total = 0.0
+        self.last_change_t = None
+        self.change_gaps = []
+
+    def update(self, t_chunk_elapsed, v_chunk):
+        v = np.asarray(v_chunk, dtype=np.float64)
+        n = v.size
+        finite_mask = np.isfinite(v)
+        nfin = int(finite_mask.sum())
+        self.count += n
+        self.nan_count += n - nfin
+        if not nfin:
+            return
+        fv = v[finite_mask]
+        self.minv = min(self.minv, float(fv.min()))
+        self.maxv = max(self.maxv, float(fv.max()))
+        self.total += float(fv.sum())
+
+        if len(self.change_gaps) < CHANGE_SAMPLE_RESERVOIR:
+            ft = np.asarray(t_chunk_elapsed, dtype=np.float64)[finite_mask]
+            changed = np.diff(fv) != 0
+            change_idx = np.where(changed)[0] + 1
+            if change_idx.size:
+                change_times = ft[change_idx]
+                gaps = list(np.diff(change_times)) if change_times.size > 1 else []
+                if self.last_change_t is not None:
+                    gaps.insert(0, float(change_times[0] - self.last_change_t))
+                room = CHANGE_SAMPLE_RESERVOIR - len(self.change_gaps)
+                self.change_gaps.extend(gaps[:room])
+                self.last_change_t = float(change_times[-1])
+
+    def finalize_period(self, fallback_dt):
+        gaps = [g for g in self.change_gaps if g > 0]
+        if gaps:
+            return float(np.median(gaps))
+        return fallback_dt
+
+    def finalize_mean(self):
+        finite = self.count - self.nan_count
+        return round(self.total / finite, 4) if finite > 0 else None
+
+
+def nan_pct_from_counts(duration_s, period_s, count, nan_count):
+    """Streaming counterpart of estimate_channel_nan_pct(): same "% of
+    expected samples at this channel's frequency that are missing" logic,
+    but from running counts instead of full arrays.
+    """
+    finite = count - nan_count
+    if not period_s or period_s <= 0 or duration_s <= 0:
+        return round(100 * (1 - finite / max(count, 1)), 2)
+    expected = int(duration_s / period_s) + 1
+    if expected > 0:
+        pct = 100 * (1 - finite / expected)
+        return round(max(0, min(100, pct)), 2)
+    return 0.0
+
+
+def estimate_signal_period(time_array, values, fallback_dt):
+    """Estimate the actual update period of a signal by detecting when values change.
+
+    For CAN signals that may be forward-filled or have lower frequency than the
+    base sampling rate, this detects the true update frequency.
+
+    Returns the estimated period in seconds (or fallback_dt if detection fails).
+
+    NOTE: full-array version, kept for the .mat path. The CSV path uses the
+    streaming equivalent, RunningChannelStat, instead.
+    """
+    vals = np.asarray(values, dtype=float)
+    t = np.asarray(time_array, dtype=float)
+
+    # Get indices where values are finite
+    finite_mask = np.isfinite(vals)
+    if np.sum(finite_mask) < 2:
+        return fallback_dt
+
+    t_finite = t[finite_mask]
+    vals_finite = vals[finite_mask]
+
+    # Method 1: Find where values actually change (for forward-filled signals)
+    if len(vals_finite) > 1:
+        changes = np.diff(vals_finite) != 0
+        change_indices = np.where(changes)[0] + 1
+        if len(change_indices) > 1:
+            change_times = t_finite[change_indices]
+            dt = np.median(np.diff(change_times))
+            if dt > 0:
+                return float(dt)
+
+    # Method 2: Use time gaps between finite samples
+    if len(t_finite) > 1:
+        dt_gaps = np.diff(t_finite)
+        dt = np.median(dt_gaps[dt_gaps > 0])  # ignore zero gaps
+        if dt > 0:
+            return float(dt)
+
+    return fallback_dt
+
+
+def estimate_channel_nan_pct(time_array, values, signal_period):
+    """Calculate missing data percentage accounting for the channel's actual frequency.
+
+    NOTE: full-array version, kept for the .mat path. The CSV path uses the
+    streaming equivalent, nan_pct_from_counts, instead.
+    """
+    vals = np.asarray(values, dtype=float)
+    t = np.asarray(time_array, dtype=float)
+
+    if len(t) < 2 or signal_period <= 0:
+        # Fallback: basic NaN percentage
+        finite = vals[np.isfinite(vals)]
+        return round(100 * (1 - finite.size / max(vals.size, 1)), 2)
+
+    # Expected number of samples at this frequency
+    duration = t[-1] - t[0]
+    expected_samples = int(duration / signal_period) + 1
+
+    # Actual finite samples
+    finite = vals[np.isfinite(vals)]
+    actual_finite = finite.size
+
+    # Missing as a percentage of expected
+    if expected_samples > 0:
+        missing_pct = 100 * (1 - actual_finite / expected_samples)
+        return round(max(0, min(100, missing_pct)), 2)  # clamp to [0, 100]
+
+    return 0.0
+
+
+def compute_level2(arrays, t):
+    """Runs the full LogFilter_Level2.m algorithm given a dict of raw
+    channel arrays (name -> np.ndarray) plus the time vector.
+
+    Only needs the "special" columns (wheel RPMs, accY, GPS lat/lon,
+    power/voltage/current) to be present in `arrays` -- the CSV path passes
+    just that handful, kept at full precision, rather than the whole file.
 
     Returns (derived_channels: dict[name -> {values, unit, description}],
              kpis: dict, sources: dict) exactly mirroring the MATLAB script's
@@ -325,17 +438,18 @@ def compute_level2(df, t):
     run_duration_s = float(t[-1] - t[0])
     derived = {}
     sources = {}
+    columns = list(arrays.keys())
 
     # ---- wheel speed from AMK RPMs ----
-    rpm_cols = [find_channel_flexible(df.columns, [n]) for n in RPM_NAMES]
+    rpm_cols = [find_channel_flexible(columns, [n]) for n in RPM_NAMES]
     wheel_speed_status, wheel_speed_failure = "failed", ""
     speed_wheel_mps = np.full(n_ref, np.nan)
 
     if all(rpm_cols):
-        accy_col = find_channel_flexible(df.columns, ACCY_CANDIDATES)
+        accy_col = find_channel_flexible(columns, ACCY_CANDIDATES)
         omega = []
         for col in rpm_cols:
-            rpm = df[col].to_numpy(dtype=float)
+            rpm = arrays[col].astype(float)
             omega.append((2 * np.pi * params["wheel_radius_m"] * rpm / 60.0) / params["gear_ratio"])
         with np.errstate(all="ignore"):
             import warnings
@@ -365,12 +479,12 @@ def compute_level2(df, t):
     distance_km = None
     distance_cum_m = np.full(n_ref, np.nan)
 
-    lat_col = find_channel_flexible(df.columns, LAT_CANDIDATES)
-    lon_col = find_channel_flexible(df.columns, LON_CANDIDATES)
+    lat_col = find_channel_flexible(columns, LAT_CANDIDATES)
+    lon_col = find_channel_flexible(columns, LON_CANDIDATES)
     gps_quality = {}
     if lat_col and lon_col:
-        lat = df[lat_col].to_numpy(dtype=float)
-        lon = df[lon_col].to_numpy(dtype=float)
+        lat = arrays[lat_col].astype(float)
+        lon = arrays[lon_col].astype(float)
         gps_dist, gps_quality = distance_from_gps(lat, lon, t, params["max_gps_segment_speed_mps"])
         if gps_dist is not None and np.isfinite(gps_dist[-1]) and gps_dist[-1] > params["min_valid_gps_distance_m"]:
             distance_cum_m = gps_dist
@@ -413,17 +527,17 @@ def compute_level2(df, t):
     total_energy_consumed_Wh, regen_energy_Wh = None, None
     power_W = None
 
-    power_col = find_channel_flexible(df.columns, POWER_CANDIDATES)
+    power_col = find_channel_flexible(columns, POWER_CANDIDATES)
     if power_col:
-        power_W = df[power_col].to_numpy(dtype=float)
+        power_W = arrays[power_col].astype(float)
         energy_method = f"Power from {power_col}; consumed energy = trapz(max(power_W,0), time) / 3600"
         energy_required_channels = [power_col]
         energy_status = "ok"
     else:
-        v_col = find_channel_flexible(df.columns, VOLTAGE_CANDIDATES)
-        i_col = find_channel_flexible(df.columns, CURRENT_CANDIDATES)
+        v_col = find_channel_flexible(columns, VOLTAGE_CANDIDATES)
+        i_col = find_channel_flexible(columns, CURRENT_CANDIDATES)
         if v_col and i_col:
-            power_W = df[v_col].to_numpy(dtype=float) * df[i_col].to_numpy(dtype=float)
+            power_W = arrays[v_col].astype(float) * arrays[i_col].astype(float)
             energy_method = (f"Power from {v_col} .* {i_col}; "
                               f"consumed energy = trapz(max(power_W,0), time) / 3600")
             energy_required_channels = [v_col, i_col]
@@ -488,118 +602,128 @@ def compute_level2(df, t):
     return derived, kpis, sources
 
 
-def estimate_signal_period(time_array, values, fallback_dt):
-    """Estimate the actual update period of a signal by detecting when values change.
-    
-    For CAN signals that may be forward-filled or have lower frequency than the
-    base sampling rate, this detects the true update frequency.
-    
-    Returns the estimated period in seconds (or fallback_dt if detection fails).
-    """
-    vals = np.asarray(values, dtype=float)
-    t = np.asarray(time_array, dtype=float)
-    
-    # Get indices where values are finite
-    finite_mask = np.isfinite(vals)
-    if np.sum(finite_mask) < 2:
-        return fallback_dt
-    
-    t_finite = t[finite_mask]
-    vals_finite = vals[finite_mask]
-    
-    # Method 1: Find where values actually change (for forward-filled signals)
-    if len(vals_finite) > 1:
-        changes = np.diff(vals_finite) != 0
-        change_indices = np.where(changes)[0] + 1
-        if len(change_indices) > 1:
-            change_times = t_finite[change_indices]
-            dt = np.median(np.diff(change_times))
-            if dt > 0:
-                return float(dt)
-    
-    # Method 2: Use time gaps between finite samples
-    if len(t_finite) > 1:
-        dt_gaps = np.diff(t_finite)
-        dt = np.median(dt_gaps[dt_gaps > 0])  # ignore zero gaps
-        if dt > 0:
-            return float(dt)
-    
-    return fallback_dt
+def distance_from_gps(lat, lon, t, max_speed_mps):
+    n = min(len(lat), len(lon), len(t))
+    lat, lon, t = lat[:n], lon[:n], t[:n]
+    valid_point = np.isfinite(lat) & np.isfinite(lon) & (np.abs(lat) <= 90) & (np.abs(lon) <= 180)
+    quality = {"n_samples": n, "n_finite_latlon": int(valid_point.sum()),
+               "n_valid_segments": 0, "n_rejected_segments": 0, "max_segment_speed_mps": max_speed_mps}
+    if valid_point.sum() < 3:
+        return None, quality
+
+    R = 6371000.0
+    lat1, lat2 = np.radians(lat[:-1]), np.radians(lat[1:])
+    lon1, lon2 = np.radians(lon[:-1]), np.radians(lon[1:])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    d = R * c
+    dt = np.diff(t)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        seg_speed = d / dt
+    valid_seg = (valid_point[:-1] & valid_point[1:] & np.isfinite(d) & np.isfinite(dt)
+                 & (dt > 0) & np.isfinite(seg_speed) & (seg_speed <= max_speed_mps))
+    quality["n_valid_segments"] = int(valid_seg.sum())
+    quality["n_rejected_segments"] = int(len(valid_seg) - valid_seg.sum())
+    d = np.where(valid_seg, d, 0.0)
+    return np.concatenate(([0.0], np.cumsum(d))), quality
 
 
-def estimate_channel_nan_pct(time_array, values, signal_period):
-    """Calculate missing data percentage accounting for the channel's actual frequency.
-    
-    Calculates expected samples based on signal_period, then reports what % of
-    expected samples are actually missing (NaN).
-    """
-    vals = np.asarray(values, dtype=float)
-    t = np.asarray(time_array, dtype=float)
-    
-    if len(t) < 2 or signal_period <= 0:
-        # Fallback: basic NaN percentage
-        finite = vals[np.isfinite(vals)]
-        return round(100 * (1 - finite.size / max(vals.size, 1)), 2)
-    
-    # Expected number of samples at this frequency
-    duration = t[-1] - t[0]
-    expected_samples = int(duration / signal_period) + 1
-    
-    # Actual finite samples
-    finite = vals[np.isfinite(vals)]
-    actual_finite = finite.size
-    
-    # Missing as a percentage of expected
-    if expected_samples > 0:
-        missing_pct = 100 * (1 - actual_finite / expected_samples)
-        return round(max(0, min(100, missing_pct)), 2)  # clamp to [0, 100]
-    
-    return 0.0
-
-
-def extract_from_csv(csv_path, proto_lut):
+def extract_from_csv(csv_path, proto_lut, chunk_rows=DEFAULT_CHUNK_ROWS, telemetry_rate=50.0):
     """CSV entry point: reads a Level 1 wide-format CSV (Time + all channel
     columns, as exported by fcp-data-muncher) and runs the full Level 2
     pipeline directly in Python -- no MATLAB step required.
+
+    Memory model: only Time + the "special" columns the Level 2 algorithm
+    needs at full precision are ever fully materialized (see module
+    docstring). Every other channel is streamed through in --chunk-rows-row
+    chunks, updating running stats and a downsampled telemetry array as it
+    goes, then discarded. Peak memory does not scale with file size.
     """
     if pd is None:
         sys.exit("Missing dependency: pip install pandas --break-system-packages")
 
-    df = pd.read_csv(csv_path)
-    time_col = find_channel_flexible(df.columns, ["Time", "time", "t", "t_ref"])
+    header = pd.read_csv(csv_path, nrows=0)
+    all_cols = list(header.columns)
+    time_col = find_channel_flexible(all_cols, ["Time", "time", "t", "t_ref"])
     if time_col is None:
         sys.exit("CSV has no recognizable time column (expected 'Time').")
+    data_cols = [c for c in all_cols if c != time_col]
 
-    t = df[time_col].to_numpy(dtype=float)
+    # Resolve the handful of columns the Level 2 algorithm needs at full
+    # precision. These -- and ONLY these -- get fully loaded into memory.
+    rpm_cols = [find_channel_flexible(data_cols, [n]) for n in RPM_NAMES]
+    accy_col = find_channel_flexible(data_cols, ACCY_CANDIDATES)
+    lat_col = find_channel_flexible(data_cols, LAT_CANDIDATES)
+    lon_col = find_channel_flexible(data_cols, LON_CANDIDATES)
+    power_col = find_channel_flexible(data_cols, POWER_CANDIDATES)
+    voltage_col = find_channel_flexible(data_cols, VOLTAGE_CANDIDATES)
+    current_col = find_channel_flexible(data_cols, CURRENT_CANDIDATES)
+    special_cols = sorted(set(
+        c for c in (rpm_cols + [accy_col, lat_col, lon_col, power_col, voltage_col, current_col])
+        if c is not None
+    ))
+
+    # Full-precision read of Time + the special columns only -- small enough
+    # to hold in memory even for a very long run, regardless of how many
+    # other channels the file has.
+    special_df = pd.read_csv(csv_path, usecols=[time_col] + special_cols, dtype=np.float64)
+    t = special_df[time_col].to_numpy()
     if len(t) < 2:
         sys.exit("CSV time column has fewer than 2 samples.")
-
+    t0 = t[0]
     duration_s = float(t[-1] - t[0])
     dt_ref = float(np.median(np.diff(t)))
     sample_rate_hz = 1.0 / dt_ref if dt_ref > 0 else None
+    n_rows = len(t)
 
-    derived, kpis, sources = compute_level2(df, t)
+    print(f"  Time spans {duration_s:.3f}s (min={t.min():.3f}, max={t.max():.3f}), "
+          f"median dt={dt_ref:.6f}s, {n_rows} rows, {len(data_cols)} channels "
+          f"(streaming in chunks of {chunk_rows:,} rows)")
+    if not np.isfinite(duration_s) or duration_s <= 0 or duration_s > 24 * 3600:
+        sys.exit(
+            f"Refusing to continue: Time column spans {duration_s:.3f}s, which looks wrong "
+            f"for a single run (min={t.min()}, max={t.max()}). Check that 'Time' is elapsed "
+            f"seconds for this run, not a raw timestamp, and check for a stray huge/garbage "
+            f"value in that column."
+        )
+
+    arrays = {c: special_df[c].to_numpy() for c in special_cols}
+    del special_df  # only `arrays` (a handful of columns) is kept from here on
+
+    output_time = build_output_time_grid(duration_s, telemetry_rate)
+
+    stats = {name: RunningChannelStat() for name in data_cols}
+    downsamplers = {name: StreamingDownsampler(output_time) for name in data_cols}
+
+    cursor = 0
+    reader = pd.read_csv(csv_path, usecols=data_cols, dtype=np.float32, chunksize=chunk_rows)
+    for chunk in reader:
+        n = len(chunk)
+        t_slice = t[cursor:cursor + n] - t0
+        cursor += n
+        for name in data_cols:
+            vals = chunk[name].to_numpy()
+            stats[name].update(t_slice, vals)
+            downsamplers[name].update(t_slice, vals)
+    if cursor != n_rows:
+        print(f"  WARNING: chunked pass read {cursor} rows but Time column has {n_rows}; "
+              "results may be based on a truncated file.", file=sys.stderr)
+
+    derived, kpis, sources = compute_level2(arrays, t)
 
     channels = []
     telemetry_channels = {}
-    errors = []
     unresolved_names = []
+    errors = []
 
-    data_cols = [c for c in df.columns if c != time_col]
     for name in data_cols:
-        vals = df[name].to_numpy(dtype=float)
-        n = vals.size
-        finite = vals[np.isfinite(vals)]
-        
-        # Estimate the actual signal period (accounting for lower-frequency channels)
-        signal_period = estimate_signal_period(t, vals, dt_ref)
-        
-        # Calculate nan_pct based on expected samples at this frequency
-        nan_pct = estimate_channel_nan_pct(t, vals, signal_period)
-        
-        vmin = round(float(np.min(finite)), 4) if finite.size else None
-        vmax = round(float(np.max(finite)), 4) if finite.size else None
-        vmean = round(float(np.mean(finite)), 4) if finite.size else None
+        st = stats[name]
+        period_s = st.finalize_period(dt_ref)
+        nan_pct = nan_pct_from_counts(duration_s, period_s, st.count, st.nan_count)
+        vmin = None if st.minv == np.inf else round(st.minv, 4)
+        vmax = None if st.maxv == -np.inf else round(st.maxv, 4)
+        vmean = st.finalize_mean()
 
         resolved, matched_base = resolve_signal(name, proto_lut)
         if resolved is None:
@@ -616,22 +740,22 @@ def extract_from_csv(csv_path, proto_lut):
             "protocol_max": resolved["max_value"] if resolved else None,
             "can_message": resolved["message"] if resolved else None,
             "mat_tool_tag": "csv-import",
-            "period_s": round(signal_period, 5),
-            "n_samples": n, "nan_pct": nan_pct,
+            "period_s": round(period_s, 5),
+            "n_samples": st.count, "nan_pct": nan_pct,
             "min": vmin, "max": vmax, "mean": vmean,
             "component": component_for(name, resolved),
         })
-        telemetry_channels[name] = vals
+        telemetry_channels[name] = json_safe_values(downsamplers[name].finalize())
 
     # Derived Level 2 channels (speed_wheel_mps, power_W, distance_cum_km, ...)
+    # are full-rate arrays already (same length as t, which we kept), so they
+    # get downsampled the same way, just not incrementally -- there are only
+    # ~5 of them, so this costs nothing extra.
     for name, d in derived.items():
         vals = d["values"]
         finite = vals[np.isfinite(vals)]
-        
-        # Derived channels are at the base sample rate
-        signal_period = dt_ref
-        nan_pct = estimate_channel_nan_pct(t, vals, signal_period)
-        
+        ds = StreamingDownsampler(output_time)
+        ds.update(t - t0, vals)
         channels.append({
             "key": name, "name": name, "type": "double",
             "device": "Level2 (derived)", "device_resolved": True,
@@ -640,13 +764,14 @@ def extract_from_csv(csv_path, proto_lut):
             "mat_tool_tag": "Level2",
             "period_s": round(dt_ref, 5),
             "n_samples": vals.size,
-            "nan_pct": nan_pct,
+            "nan_pct": nan_pct_from_counts(duration_s, dt_ref, vals.size,
+                                            int(np.sum(~np.isfinite(vals)))),
             "min": round(float(np.min(finite)), 4) if finite.size else None,
             "max": round(float(np.max(finite)), 4) if finite.size else None,
             "mean": round(float(np.mean(finite)), 4) if finite.size else None,
             "component": "Level 2 Derived",
         })
-        telemetry_channels[name] = vals
+        telemetry_channels[name] = json_safe_values(ds.finalize())
 
     if unresolved_names:
         errors.append(
@@ -666,8 +791,11 @@ def extract_from_csv(csv_path, proto_lut):
         "level": "Level2",
         "kpis": kpis,
         "level2_sources": sources,
+        # Already at display rate -- process_file() must NOT run these
+        # through downsample_channels() again.
         "telemetry_channels": telemetry_channels,
-        "telemetry_time_s": t,
+        "telemetry_rate_hz": telemetry_rate,
+        "telemetry_already_downsampled": True,
     }
 
 
@@ -986,22 +1114,204 @@ def upsert_catalogue(catalogue_path: Path, run: dict):
     temporary.replace(catalogue_path)
 
 
+def process_file(input_file: Path, args, proto_lut: dict) -> dict:
+    """Runs the full single-file pipeline (extract -> telemetry JSON -> catalogue
+    upsert -> summary) for one .csv or .mat file. Returns the summary dict that
+    was upserted so callers can print/aggregate results. Raises on unrecoverable
+    per-file errors (e.g. unrecognized extension, missing dependency); the
+    caller decides whether to abort or continue past that when batching.
+    """
+    date, time = args.date, args.time
+    stem = input_file.stem
+    if (date is None or time is None) and "_" in stem:
+        parts = stem.split("_")
+        if len(parts) >= 2:
+            date = date or parts[0]
+            time = time or parts[1].replace("-", ":")
+
+    suffix = input_file.suffix.lower()
+
+    if suffix == ".csv":
+        extracted = extract_from_csv(input_file, proto_lut, chunk_rows=args.chunk_rows,
+                                      telemetry_rate=args.telemetry_rate)
+    elif suffix == ".mat":
+        if h5py is None:
+            raise RuntimeError("Missing dependency: pip install h5py --break-system-packages")
+        extracted = extract(input_file, proto_lut)
+    else:
+        raise ValueError(f"Unrecognized file extension '{suffix}'. Expected .mat or .csv.")
+
+    run_id = f"run-{stem}"
+    telemetry_path = args.telemetry_dir / f"{run_id}.json"
+    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if extracted.pop("telemetry_already_downsampled", False):
+        # The CSV path already built display-rate telemetry incrementally
+        # while streaming -- running it through downsample_channels() again
+        # would require the full-rate arrays we specifically avoided keeping.
+        telemetry_channels = extracted.pop("telemetry_channels")
+        telemetry_rate = extracted.pop("telemetry_rate_hz")
+    else:
+        telemetry_channels, telemetry_rate = downsample_channels(
+            extracted.pop("telemetry_channels", {}), extracted["sample_rate_hz"], args.telemetry_rate,
+            extracted.pop("telemetry_time_s", None))
+
+    telemetry = {
+        "schema_version": 1,
+        "sample_rate": telemetry_rate,
+        "channels": telemetry_channels,
+    }
+    telemetry_path.write_text(json.dumps(telemetry, separators=(",", ":"), allow_nan=False))
+
+    run = {
+        "id": run_id,
+        "file": input_file.name,
+        "date": date or "unknown",
+        "time": time or "unknown",
+        "event": args.event,
+        "session_type": args.session_type,
+        "driver": args.driver,
+        "origin": args.origin,
+        "config": {
+            "aeropack": bool(args.aeropack),
+            "spring_rate": args.springs,
+            "arb": args.arb,
+            "class": args.car_class,
+        },
+        # Mirrors the shared manual test-log categories. These are deliberately
+        # present even when blank so the browser can show what still needs to
+        # be recorded for a comparable run.
+        "manual_log": {
+            "location": None, "objective": None, "laps": None, "best_lap_time": None,
+            "tyres": None, "tyre_pressures": None, "damper_setup": None,
+            "arb_position": args.arb, "torque_vectoring_map": None, "regen_map": None,
+            "torque_limits": None, "battery_used": None, "non_operational_signals": None,
+            "issues": None, "driver_feedback": None, "weather": None,
+            "track_conditions": None, "ambient_temp": None, "grip": None,
+        },
+        "duration_s": extracted["duration_s"],
+        "sample_rate_hz": extracted["sample_rate_hz"],
+        "n_channels": extracted["n_channels"],
+        "n_unresolved": extracted["n_unresolved"],
+        # Channel descriptors are catalogue metadata (not sample arrays). They
+        # make global channel/component/device search and quality flagging
+        # possible without loading a run's telemetry file.
+        "channels": extracted["channels"],
+        "channel_names": [channel["key"] for channel in extracted["channels"]],
+        "extraction_errors": extracted["extraction_errors"],
+        "level": extracted["level"],
+        "kpis": extracted["kpis"],
+        "telemetry_file": telemetry_path.as_posix(),
+    }
+    upsert_catalogue(args.catalogue, run)
+
+    print(f"Updated {args.catalogue}; wrote {telemetry_path}  ({extracted['n_channels']} channels, "
+          f"{len(extracted['extraction_errors'])} extraction errors, "
+          f"level={extracted['level']})")
+    if extracted["kpis"]:
+        print("KPIs:")
+        for name, k in extracted["kpis"].items():
+            if k["status"] == "ok":
+                print(f"  {name:30s} = {k['value']:.4g} {k['unit']}")
+            else:
+                print(f"  {name:30s} = FAILED | {k['failure_reason']}")
+    elif extracted["level"] == "Level1":
+        print("No level2Info found -- this is a Level 1 file. "
+              "Run LogFilter_Level2.m first to get KPIs.")
+    if extracted["extraction_errors"]:
+        print("Errors:")
+        for e in extracted["extraction_errors"]:
+            print(f"  - {e}")
+
+    return run
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input_file", type=Path,
-                    help="Path to a *_resampled.mat file (h5py/HDF5 path) OR a Level 1 wide-format "
-                         ".csv file (Time + all channel columns) -- format is auto-detected by extension. "
+                    help="Path to a *_resampled.mat file (h5py/HDF5 path), a Level 1 wide-format "
+                         ".csv file (Time + all channel columns), OR a directory containing multiple "
+                         ".csv/.mat files to batch-process -- format is auto-detected by extension. "
                          "For .csv input, Level 2 KPIs are computed directly in Python (same algorithm as "
-                         "LogFilter_Level2.m); no MATLAB step is needed.")
+                         "LogFilter_Level2.m); no MATLAB step is needed. CSV files are streamed in "
+                         "row-chunks (see --chunk-rows), so file size does not drive memory usage.")
     p.add_argument("--catalogue", type=Path, default=Path("catalogue.json"),
                    help="Catalogue JSON to update (default: catalogue.json)")
     p.add_argument("--telemetry-dir", type=Path, default=Path("telemetry"),
                    help="Directory for per-run telemetry files (default: telemetry)")
     p.add_argument("--telemetry-rate", type=float, default=50.0,
-                   help="Graph sample rate in Hz (default: 50; use 0 to retain every source sample)")
+                   help="Graph sample rate in Hz (default: 50; use 0 to retain every source sample "
+                        "-- NOTE: 0 disables the CSV streaming downsampler's memory bound; only use "
+                        "it on files you know fit in memory)")
+    p.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS,
+                   help=f"Rows per chunk when streaming a CSV (default: {DEFAULT_CHUNK_ROWS:,}). "
+                        "Lower this if you still see memory pressure on a very wide file (many "
+                        "hundreds of channels); raise it for more speed on a narrow one. Has no "
+                        "effect on .mat input.")
     p.add_argument("--protocol", type=Path, default=None,
                     help="Path to fst.json (CAN protocol definition). Strongly recommended -- "
                          "without it, device/unit/component are guessed from channel name substrings only.")
     p.add_argument("--event", default="Uncategorised", help="Event name, e.g. 'FSPT Testing Day'")
     p.add_argument("--session-type", default="Other", help="Skidpad / Autocross / Endurance / Acceleration / Practice")
-    p.add_
+    p.add_argument("--driver", default="Unknown")
+    p.add_argument("--date", default=None, help="YYYY-MM-DD (default: parsed from filename if possible)")
+    p.add_argument("--time", default=None, help="HH:MM (default: parsed from filename if possible)")
+    p.add_argument("--aeropack", action="store_true", help="Flag if aeropack was fitted")
+    p.add_argument("--springs", default="Unknown", help="Spring rate setup, e.g. Soft/Medium/Stiff")
+    p.add_argument("--arb", default="Unknown", help="Anti-roll bar setup")
+    p.add_argument("--class", dest="car_class", default="Class 1 EV")
+    p.add_argument("--origin", choices=["real", "synthetic"], default="real")
+    p.add_argument("--recursive", action="store_true",
+                   help="When input_file is a directory, also descend into subdirectories")
+    p.add_argument("--keep-going", action="store_true",
+                   help="When batch-processing a directory, continue past files that fail to extract "
+                        "instead of stopping at the first error")
+    args = p.parse_args()
+
+    if not args.input_file.exists():
+        sys.exit(f"Path not found: {args.input_file}")
+
+    proto_lut = load_protocol(args.protocol)
+
+    if args.input_file.is_dir():
+        pattern_fn = Path.rglob if args.recursive else Path.glob
+        files = sorted(
+            {f for ext in ("*.csv", "*.mat") for f in pattern_fn(args.input_file, ext)}
+        )
+        if not files:
+            sys.exit(f"No .csv or .mat files found in {args.input_file}"
+                      f"{' (recursively)' if args.recursive else ''}.")
+
+        print(f"Found {len(files)} file(s) in {args.input_file}. Processing...\n")
+        succeeded, failed = [], []
+        for f in files:
+            print(f"--- {f.name} ---")
+            try:
+                run = process_file(f, args, proto_lut)
+                succeeded.append(run["file"])
+            except Exception as e:
+                failed.append((f.name, str(e)))
+                print(f"  FAILED: {e}")
+                if not args.keep_going:
+                    sys.exit(
+                        f"\nStopped after failure on {f.name}. "
+                        f"Pass --keep-going to skip failed files and continue."
+                    )
+            print()
+
+        print(f"Done. {len(succeeded)} succeeded, {len(failed)} failed.")
+        if failed:
+            print("Failed files:")
+            for name, err in failed:
+                print(f"  - {name}: {err}")
+    else:
+        try:
+            process_file(args.input_file, args, proto_lut)
+        except Exception as e:
+            sys.exit(str(e))
+
+    print("\nNext step: serve this folder and open index.html. The browser will lazy-load telemetry only when a run is opened.")
+
+
+if __name__ == "__main__":
+    main()
