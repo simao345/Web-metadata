@@ -1,4 +1,4 @@
-const state = { runs: [], active: null, selected: new Set(), tab: 'Overview', telemetry: new Map() };
+const state = { runs: [], active: null, selected: new Set(), tab: 'Overview', telemetry: new Map(), catalogue: null, fileHandle: null };
 const $ = (selector) => document.querySelector(selector);
 const esc = (value = '') => String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const duration = (seconds) => seconds == null ? '—' : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
@@ -6,11 +6,81 @@ const unique = (values) => [...new Set(values.filter(Boolean))].sort();
 const notesKey = (runId) => `fst-telemetry-note:${runId}`;
 const number = (value) => Number.isFinite(value) ? value.toFixed(Math.abs(value) >= 100 ? 1 : 3) : '—';
 
+// ============================================================================
+// CATALOGUE FILE I/O
+// Edits now target catalogue.json itself, not a browser-only side store.
+// Two ways in:
+//  - fetch('catalogue.json') at load, read-only (works everywhere, including
+//    when this is served over plain http from any static server).
+//  - "Open catalogue.json for editing" -> window.showOpenFilePicker, which
+//    hands back a real FileSystemFileHandle. Only Chrome/Edge (and other
+//    Chromium browsers) support this API. Once you have a handle, Save
+//    writes straight back to that file on disk via createWritable().
+// If no handle exists (Firefox/Safari, or you never opened one), Save falls
+// back to downloading an updated catalogue.json that you replace manually.
+// ============================================================================
+async function writeCatalogueToDisk() {
+  if (!state.catalogue) return { ok: false, error: new Error('No catalogue loaded.') };
+  const json = JSON.stringify(state.catalogue, null, 2);
+  if (state.fileHandle) {
+    try {
+      const writable = await state.fileHandle.createWritable();
+      await writable.write(json);
+      await writable.close();
+      return { ok: true, method: 'disk' };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  }
+  const blob = new Blob([json], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'catalogue.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  return { ok: true, method: 'download' };
+}
+
+function injectFileControls() {
+  const anchor = $('#clearFilters');
+  const toolbar = anchor ? anchor.parentElement : document.body;
+  const wrap = document.createElement('span');
+  wrap.id = 'fileControls';
+  wrap.style.marginLeft = '8px';
+  const supportsFS = 'showOpenFilePicker' in window;
+  wrap.innerHTML = supportsFS
+    ? `<button id="openCatalogue" class="quiet">Open catalogue.json for editing</button> <span id="fileStatus" class="note-help"></span>`
+    : `<span class="note-help">Your browser can't save files directly (that needs Chrome or Edge) — saving edits will download an updated catalogue.json for you to replace manually.</span>`;
+  toolbar.appendChild(wrap);
+  if (!supportsFS) return;
+  $('#openCatalogue').onclick = async () => {
+    try {
+      const [handle] = await window.showOpenFilePicker({
+        types: [{ description: 'Catalogue JSON', accept: { 'application/json': ['.json'] } }],
+      });
+      const file = await handle.getFile();
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      state.catalogue = parsed;
+      state.runs = parsed.runs || [];
+      state.fileHandle = handle;
+      state.telemetry.clear();
+      state.active = null; state.selected.clear();
+      refreshFilterOptions(); renderList();
+      $('#fileStatus').textContent = `Editing ${file.name} — saves write directly to this file.`;
+      $('#status').textContent = `${state.runs.length} run${state.runs.length === 1 ? '' : 's'} indexed (editable)`;
+    } catch (error) {
+      if (error.name !== 'AbortError') $('#fileStatus').textContent = `Could not open file: ${error.message}`;
+    }
+  };
+}
+
 async function init() {
   try {
     const response = await fetch('catalogue.json');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const catalogue = await response.json();
+    state.catalogue = catalogue;
     state.runs = catalogue.runs || [];
     populateFilters(); renderList();
     $('#status').textContent = `${state.runs.length} run${state.runs.length === 1 ? '' : 's'} indexed`;
@@ -18,18 +88,30 @@ async function init() {
     $('#status').textContent = 'Catalogue unavailable';
     $('#runList').innerHTML = `<p class="error">Could not load catalogue.json: ${esc(error.message)}. Serve this folder with a web server rather than opening the file directly.</p>`;
   }
+  injectFileControls();
 }
 
 function populateFilters() {
-  [['#eventFilter','event'],['#driverFilter','driver'],['#sessionFilter','session_type']].forEach(([selector,key]) => {
-    const select = $(selector);
-    unique(state.runs.map(run => run[key])).forEach(value => select.insertAdjacentHTML('beforeend', `<option value="${esc(value)}">${esc(value)}</option>`));
-    select.onchange = renderList;
-  });
+  refreshFilterOptions();
   $('#search').oninput = renderList;
   $('#clearFilters').onclick = () => { $('#search').value = ''; ['#eventFilter','#driverFilter','#sessionFilter'].forEach(s => $(s).value = ''); renderList(); };
   $('#compareButton').onclick = openComparison;
   $('#kpiButton').onclick = openKpiBuilder;
+}
+
+// Rebuilds the option lists for the three filter selects from the current
+// state.runs, preserving whatever is currently selected. Split out from
+// populateFilters so an edit (or opening a new file) can refresh the
+// dropdowns without re-binding every other listener.
+function refreshFilterOptions() {
+  [['#eventFilter','event'],['#driverFilter','driver'],['#sessionFilter','session_type']].forEach(([selector,key]) => {
+    const select = $(selector);
+    const previous = select.value;
+    select.querySelectorAll('option[data-generated]').forEach(option => option.remove());
+    unique(state.runs.map(run => run[key])).forEach(value => select.insertAdjacentHTML('beforeend', `<option data-generated value="${esc(value)}">${esc(value)}</option>`));
+    if ([...select.options].some(option => option.value === previous)) select.value = previous;
+    select.onchange = renderList;
+  });
 }
 
 function matches(run) {
@@ -84,29 +166,126 @@ function kpiCards(run) {
 function baseWorkspace(run) {
   return `<div class="run-header"><div><h2>${esc(run.event)} — ${esc(run.session_type)}</h2><p>${esc(run.driver)} · ${esc(run.date)} ${esc(run.time || '')} · ${esc(run.file)}</p></div><span class="tag">${run.telemetry_file ? 'Telemetry available' : 'Metadata only'}</span></div><nav class="tabs">${['Overview','Channels','Graphs','Statistics','Notes','Files'].map(tab => `<button class="tab ${state.tab === tab ? 'active' : ''}" data-tab="${tab}">${tab}</button>`).join('')}</nav><div id="tabContent"></div>`;
 }
-function logValue(value) { return value === null || value === undefined || value === '' ? '<span class="placeholder">Not recorded</span>' : esc(value); }
-function logSection(title, fields) { return `<div class="log-section"><h3>${title}</h3>${fields.map(([label, value]) => `<div><span>${label}</span><strong>${logValue(value)}</strong></div>`).join('')}</div>`; }
-function manualLogOverview(run) {
-  const log = run.manual_log || {}, config = run.config || {};
-  return `<div class="manual-log"><h3 class="manual-title">Manual test log</h3><p class="note-help">Context recorded alongside the telemetry; empty values identify fields still to be completed.</p><div class="log-grid">${
-    logSection('Run identification', [['Event', run.event], ['Location', log.location], ['Run start', `${run.date || '—'} ${run.time || ''}`], ['Log reference', run.file]]) +
-    logSection('Test objective', [['Objective', log.objective]]) +
-    logSection('Driver & session', [['Driver', run.driver], ['Laps', log.laps], ['Best lap time', log.best_lap_time], ['Distance in log', run.kpis?.distance_km?.value ? `${run.kpis.distance_km.value} km` : null]]) +
-    logSection('Mechanical setup', [['Tyres', log.tyres], ['Tyre pressures', log.tyre_pressures], ['Damper setup', log.damper_setup], ['Springs', config.spring_rate], ['ARB position', log.arb_position || config.arb], ['Aeropack', config.aeropack ? 'Fitted' : 'Not fitted']]) +
-    logSection('Control setup', [['Torque vectoring map', log.torque_vectoring_map], ['Regen map', log.regen_map], ['Torque limits', log.torque_limits]]) +
-    logSection('Energy system', [['Battery used', log.battery_used]]) +
-    logSection('Data quality', [['Non-operational signals', log.non_operational_signals]]) +
-    logSection('Reliability & issues', [['Issues', log.issues]]) +
-    logSection('Driver feedback', [['Feedback', log.driver_feedback]]) +
-    logSection('Environmental context', [['Weather', log.weather], ['Track conditions', log.track_conditions], ['Ambient temperature', log.ambient_temp], ['Grip', log.grip]])
-  }</div></div>`;
+
+// Structured editor for one run: the same fields the old read-only
+// "Manual test log" panel displayed, now as inputs. Each field carries
+// data-scope/data-field so applyRunEdits() can write it back onto the
+// right place on the run object (top-level, run.manual_log, or
+// run.config) without a big hand-written list of assignments. Channel
+// data and computed KPIs are intentionally left out -- those come from
+// extract_run.py, not from someone typing in the browser.
+function editField(scope, field, label, value, opts = {}) {
+  const { multiline = false, type = 'text' } = opts;
+  if (type === 'boolean') {
+    return `<div class="edit-field"><label><input type="checkbox" data-scope="${scope}" data-field="${field}" data-type="boolean" ${value ? 'checked' : ''}> ${esc(label)}</label></div>`;
+  }
+  const val = value == null ? '' : value;
+  const control = multiline
+    ? `<textarea data-scope="${scope}" data-field="${field}" placeholder="Not recorded">${esc(val)}</textarea>`
+    : `<input data-scope="${scope}" data-field="${field}" value="${esc(val)}" placeholder="Not recorded">`;
+  return `<div class="edit-field"><label>${esc(label)}${control}</label></div>`;
 }
+function runEditor(run) {
+  const log = run.manual_log || {}, config = run.config || {};
+  return `<div class="panel">
+    <h3>Edit run — writes back to catalogue.json</h3>
+    <p class="note-help">Saving rewrites the whole catalogue.json${state.fileHandle ? ' directly on disk' : ' as a download for you to replace manually'}. Channel data and automatic KPIs above are untouched — only these fields change.</p>
+    <form id="runEditorForm">
+      <h4>Run identification</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('top','event','Event',run.event)}
+        ${editField('top','driver','Driver',run.driver)}
+        ${editField('top','session_type','Session type',run.session_type)}
+        ${editField('top','date','Date',run.date)}
+        ${editField('top','time','Time',run.time)}
+        ${editField('manual','location','Location',log.location)}
+      </div>
+      <h4>Test objective</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','objective','Objective',log.objective,{multiline:true})}
+      </div>
+      <h4>Driver & session</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','laps','Laps',log.laps)}
+        ${editField('manual','best_lap_time','Best lap time',log.best_lap_time)}
+      </div>
+      <h4>Mechanical setup</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','tyres','Tyres',log.tyres)}
+        ${editField('manual','tyre_pressures','Tyre pressures',log.tyre_pressures)}
+        ${editField('manual','damper_setup','Damper setup',log.damper_setup)}
+        ${editField('manual','arb_position','ARB position',log.arb_position)}
+        ${editField('config','spring_rate','Springs (config)',config.spring_rate)}
+        ${editField('config','arb','ARB (config)',config.arb)}
+        ${editField('config','aeropack','Aeropack fitted',config.aeropack,{type:'boolean'})}
+      </div>
+      <h4>Control setup</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','torque_vectoring_map','Torque vectoring map',log.torque_vectoring_map)}
+        ${editField('manual','regen_map','Regen map',log.regen_map)}
+        ${editField('manual','torque_limits','Torque limits',log.torque_limits)}
+      </div>
+      <h4>Energy system</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','battery_used','Battery used',log.battery_used)}
+      </div>
+      <h4>Data quality</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','non_operational_signals','Non-operational signals',log.non_operational_signals,{multiline:true})}
+      </div>
+      <h4>Reliability & issues</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','issues','Issues',log.issues,{multiline:true})}
+      </div>
+      <h4>Driver feedback</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','driver_feedback','Feedback',log.driver_feedback,{multiline:true})}
+      </div>
+      <h4>Environmental context</h4>
+      <div class="log-grid" style="grid-template-columns:1fr 1fr;">
+        ${editField('manual','weather','Weather',log.weather)}
+        ${editField('manual','track_conditions','Track conditions',log.track_conditions)}
+        ${editField('manual','ambient_temp','Ambient temperature',log.ambient_temp)}
+        ${editField('manual','grip','Grip',log.grip)}
+      </div>
+    </form>
+    <div class="notes-actions"><span id="editorStatus"></span><button id="saveCatalogue">Save to catalogue.json</button></div>
+  </div>`;
+}
+function applyRunEdits(run, form) {
+  form.querySelectorAll('[data-field]').forEach(el => {
+    const { scope, field, type } = el.dataset;
+    const raw = type === 'boolean' ? el.checked : el.value.trim();
+    const value = (type !== 'boolean' && raw === '') ? null : raw;
+    if (scope === 'top') run[field] = value;
+    else if (scope === 'manual') { run.manual_log = run.manual_log || {}; run.manual_log[field] = value; }
+    else if (scope === 'config') { run.config = run.config || {}; run.config[field] = value; }
+  });
+}
+function wireRunEditor(run) {
+  const form = $('#runEditorForm');
+  $('#saveCatalogue').onclick = async () => {
+    applyRunEdits(run, form);
+    refreshFilterOptions();
+    $('#editorStatus').textContent = 'Saving…';
+    const result = await writeCatalogueToDisk();
+    $('#editorStatus').textContent = result.ok
+      ? (result.method === 'disk' ? 'Saved to catalogue.json.' : 'Downloaded updated catalogue.json — replace the file in your project.')
+      : `Could not save: ${result.error.message}`;
+    renderList();
+    await renderWorkspace();
+  };
+}
+
 async function renderWorkspace() {
   const run = state.active; if (!run) return;
   $('#workspace').innerHTML = baseWorkspace(run);
   document.querySelectorAll('.tab').forEach(tab => tab.onclick = async () => { state.tab = tab.dataset.tab; await renderWorkspace(); });
   const content = $('#tabContent');
-  if (state.tab === 'Overview') content.innerHTML = `<div class="overview-grid"><div class="metric"><span>Driver</span><strong>${esc(run.driver)}</strong></div><div class="metric"><span>Duration</span><strong>${duration(run.duration_s)}</strong></div><div class="metric"><span>Sample rate</span><strong>${run.sample_rate_hz ? `${run.sample_rate_hz} Hz` : '—'}</strong></div><div class="metric"><span>Channels</span><strong>${run.n_channels || 0}</strong></div></div><div class="panel"><h3>Automatic KPIs</h3><div class="kpis">${kpiCards(run) || '<p class="notice">No KPI data has been exported.</p>'}</div></div>${manualLogOverview(run)}`;
+  if (state.tab === 'Overview') {
+    content.innerHTML = `<div class="overview-grid"><div class="metric"><span>Driver</span><strong>${esc(run.driver)}</strong></div><div class="metric"><span>Duration</span><strong>${duration(run.duration_s)}</strong></div><div class="metric"><span>Sample rate</span><strong>${run.sample_rate_hz ? `${run.sample_rate_hz} Hz` : '—'}</strong></div><div class="metric"><span>Channels</span><strong>${run.n_channels || 0}</strong></div></div><div class="panel"><h3>Automatic KPIs</h3><div class="kpis">${kpiCards(run) || '<p class="notice">No KPI data has been exported.</p>'}</div></div>${runEditor(run)}`;
+    wireRunEditor(run);
+  }
   else if (state.tab === 'Channels') await renderChannels(run, content);
   else if (state.tab === 'Graphs') await renderGraphs(run, content);
   else if (state.tab === 'Statistics') await renderStatistics(run, content);
